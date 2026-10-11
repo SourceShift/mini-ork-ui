@@ -40,6 +40,17 @@ const BOARD_MIN: f32 = 200.;
 /// on every render, short enough that a transient failure repairs itself
 /// within a poll or two.
 const THUMBS_RETRY: Duration = Duration::from_secs(10);
+/// How often a board with something working re-reads its cards' DAGs. The
+/// store's own live cadence (`store::MIN_GAP`), so a card cannot fall behind
+/// the rows beside it.
+///
+/// The signature alone cannot pace this: it is built from the *shell* board,
+/// whose row for a working run (`step`, `cost_usd`, `state`) is byte-identical
+/// for the whole time that run sits on one node — `step` moves only at a node
+/// boundary and the cost lands at node end. A content-keyed guard therefore
+/// holds a card at its first frame for as long as the node runs, which is how
+/// a fifteen-node run shows "3 of 15" against a graph that finished.
+const THUMBS_LIVE_GAP: Duration = Duration::from_millis(1500);
 
 /// The activity bar, top to bottom: key, glyph, tooltip.
 const ACTIVITIES: [(&str, &str, &str); 12] = [
@@ -108,6 +119,16 @@ pub struct MiniOrkSidebar {
     /// not spawn a subprocess on every render, but a single hiccup must not
     /// leave the board without DAGs until the run set happens to change.
     thumbs_retry_at: Option<Instant>,
+    /// When the last thumbnail read landed, so a board with something working
+    /// can pace itself by time rather than by the shell board's content — see
+    /// `THUMBS_LIVE_GAP`.
+    thumbs_read_at: Option<Instant>,
+    /// Whether anything was working at the last thumbnail read. The
+    /// working→idle edge forces one final read, so a run that has just
+    /// finished always loses the frame it had while it was live — rather than
+    /// depending on `store_generation` to have moved (which it does not, if the
+    /// store lookup fails and it answers 0).
+    thumbs_was_working: bool,
     /// Run cards whose node list the user folded.
     folded: HashSet<String>,
     _thumbs: Task<()>,
@@ -151,6 +172,8 @@ impl MiniOrkSidebar {
                 this.thumbs.clear();
                 this.thumbs_sig = None;
                 this.thumbs_retry_at = None;
+                this.thumbs_read_at = None;
+                this.thumbs_was_working = false;
                 cx.notify();
             }
         });
@@ -185,6 +208,8 @@ impl MiniOrkSidebar {
             thumbs_sig: None,
             loading_thumbs: false,
             thumbs_retry_at: None,
+            thumbs_read_at: None,
+            thumbs_was_working: false,
             folded: HashSet::new(),
             _thumbs: Task::ready(()),
             _search: Task::ready(()),
@@ -338,13 +363,22 @@ impl MiniOrkSidebar {
         // A working run keeps its id while it adds nodes, so fold in the store
         // generation — but only then, or every cost tick would re-read the
         // whole board.
-        let generation = if runs.iter().any(|run| run.state == "working") {
-            self.store_generation(cx)
-        } else {
-            0
-        };
+        let working = runs.iter().any(|run| run.state == "working");
+        let generation = if working { self.store_generation(cx) } else { 0 };
         let signature = (ids.clone(), generation);
-        if self.loading_thumbs || self.thumbs_sig.as_ref() == Some(&signature) {
+        if self.loading_thumbs {
+            return;
+        }
+        // While something is working the cards are paced by a clock, not by the
+        // signature: the shell board cannot see node progress, so the signature
+        // would sit unchanged through an entire node — see `THUMBS_LIVE_GAP`.
+        // Everything else is still content-keyed: a run appearing or finishing
+        // changes the board, and the read follows at once.
+        if working {
+            if self.thumbs_read_at.is_some_and(|at| at.elapsed() < THUMBS_LIVE_GAP) {
+                return;
+            }
+        } else if !self.thumbs_was_working && self.thumbs_sig.as_ref() == Some(&signature) {
             return;
         }
         let Some((bin, home)) = self.target(cx) else {
@@ -355,11 +389,17 @@ impl MiniOrkSidebar {
         // Set before the spawn: a render while the fetch is in flight must not
         // start a second one.
         self.thumbs_sig = Some(signature.clone());
+        self.thumbs_was_working = working;
         self.loading_thumbs = true;
         self._thumbs = cx.spawn(async move |this, cx| {
             let fetched = cx.background_spawn(board::fetch_thumbs(bin, home, ids)).await;
             this.update(cx, |this, cx| {
                 this.loading_thumbs = false;
+                // Stamped on landing rather than on issue, so the gap measures
+                // the space between two reads of mini-ork rather than between
+                // two spawns. Stamped before the signature check: a read that
+                // arrives unwanted still cost the engine the same.
+                this.thumbs_read_at = Some(Instant::now());
                 // The signature is the guard against an answer that is no
                 // longer wanted: a workspace switch clears it, and a newer read
                 // replaces it. Either way this result is for a board that is
@@ -1057,13 +1097,21 @@ impl MiniOrkSidebar {
         // nodes, not just the ones in flight or waiting on you. A run with no
         // DAG — an unresolvable recipe, or a read that has not landed yet — has
         // nothing to list and stays a plain row.
+        // Rows are separated by a bottom border rather than a full box, so the
+        // list reads as one column of threads with a rule between them.
         let Some(dag) = self.thumbs.get(&run.id).filter(|dag| !dag.nodes.is_empty()) else {
-            return ListItem::new(SharedString::from(format!("board-run-{}", run.id)))
-                .selectable(true)
-                .toggle_state(selected)
-                .when_some(tooltip, |this, tip| this.tooltip(Tooltip::text(tip)))
-                .on_click(open)
-                .child(lines())
+            return div()
+                .w_full()
+                .border_b_1()
+                .border_color(c(p::BORDER))
+                .child(
+                    ListItem::new(SharedString::from(format!("board-run-{}", run.id)))
+                        .selectable(true)
+                        .toggle_state(selected)
+                        .when_some(tooltip, |this, tip| this.tooltip(Tooltip::text(tip)))
+                        .on_click(open)
+                        .child(lines()),
+                )
                 .into_any_element();
         };
 
@@ -1100,37 +1148,45 @@ impl MiniOrkSidebar {
         });
         let body: Option<AnyElement> =
             (!folded).then(|| self.render_nodes(run, dag, now, workspace, cx));
-        // Every row is a `ListItem`, so hover, selection and the card's border
-        // come from the theme rather than from colours of our own. The header
-        // keeps the click that opens the run: the fold row and the node rows
-        // below it toggle and navigate, and a click on those must not also open
-        // the run.
+        // Every row is a `ListItem`, so hover and selection come from the theme
+        // rather than from colours of our own. The header keeps the click that
+        // opens the run: the fold row and the node rows below it toggle and
+        // navigate, and a click on those must not also open the run.
         //
         // `ListItem` lays its children out in a row (`h_flex`, clipped), so the
         // header, the fold row and the node list have to be ONE vertical child:
         // handed over separately, the fold chevron lands beside the header and
         // the node list is squeezed to nothing.
-        ListItem::new(SharedString::from(format!("board-run-{}", run.id)))
-            .spacing(ListItemSpacing::Sparse)
-            .selectable(true)
-            .outlined()
-            .toggle_state(selected)
+        //
+        // The card carries a bottom border only — the row separator. It is
+        // wrapped rather than `.outlined()`, which would draw a full box and
+        // make the column read as a stack of tiles.
+        div()
+            .w_full()
+            .border_b_1()
+            .border_color(c(p::BORDER))
             .child(
-                v_flex()
-                    .w_full()
-                    .gap_0p5()
+                ListItem::new(SharedString::from(format!("board-run-{}", run.id)))
+                    .spacing(ListItemSpacing::Sparse)
+                    .selectable(true)
+                    .toggle_state(selected)
                     .child(
                         v_flex()
-                            .id(SharedString::from(format!("board-run-head-{}", run.id)))
                             .w_full()
                             .gap_0p5()
-                            .cursor_pointer()
-                            .child(lines())
-                            .when_some(tooltip, |this, tip| this.tooltip(Tooltip::text(tip)))
-                            .on_click(open),
-                    )
-                    .children(fold_row)
-                    .children(body),
+                            .child(
+                                v_flex()
+                                    .id(SharedString::from(format!("board-run-head-{}", run.id)))
+                                    .w_full()
+                                    .gap_0p5()
+                                    .cursor_pointer()
+                                    .child(lines())
+                                    .when_some(tooltip, |this, tip| this.tooltip(Tooltip::text(tip)))
+                                    .on_click(open),
+                            )
+                            .children(fold_row)
+                            .children(body),
+                    ),
             )
             .into_any_element()
     }

@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> Remove this line to confirm you've reviewed this PR before submitting.
+
 # `mini_ork_ui` — the mini-ork IDE crate
 
 The source of the **mini-ork IDE**, the native (GPUI) user interface for

@@ -480,6 +480,12 @@ impl MiniOrkPage {
             arr(s, "cli").iter().map(|a| a.as_str().unwrap_or_default().to_string()).collect();
         let editor = composer.editor.clone();
         let empty = editor.text(cx).trim().is_empty();
+        // A composer aimed at a subcommand whose own parser rejects `--home`
+        // (`resume`, `nodes`, …) says so on the section; the action then carries
+        // the same `home: false` a `cli()` button does, and the subcommand reads
+        // `MINI_ORK_HOME`, which the action path always sets. Cloned out here
+        // because the send closure is `'static` and cannot hold the section.
+        let home = s.get("home").cloned();
 
         // A single send path shared by Enter and the button.
         let send: Arc<dyn Fn(&mut Window, &mut App)> = {
@@ -494,7 +500,10 @@ impl MiniOrkPage {
                 editor.clear(window, cx);
                 let mut argv = cli.clone();
                 argv.push(text);
-                let action = serde_json::json!({ "cli": argv });
+                let mut action = serde_json::json!({ "cli": argv });
+                if let Some(home) = home.clone() {
+                    action["home"] = home;
+                }
                 let Some(workspace) = workspace.upgrade() else {
                     return;
                 };
