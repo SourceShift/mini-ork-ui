@@ -40,8 +40,9 @@ const STREAM_POLL: Duration = Duration::from_millis(1500);
 /// deepest column plus its head labels, without crowding the detail below.
 const NODE_TAB_DAG_H: f32 = 280.;
 /// The node inspector, in reading order: what happened, the live work, the
-/// code it changed, what it was given and produced, then the raw material.
-const TABS: [(&str, &str); 8] = [
+/// code it changed, what it was given and produced, then the raw material,
+/// and last the harness the node was wired to.
+const TABS: [(&str, &str); 9] = [
     ("overview", "Overview"),
     ("stream", "Stream"),
     ("changes", "Changes"),
@@ -50,6 +51,7 @@ const TABS: [(&str, &str); 8] = [
     ("output", "Output"),
     ("telemetry", "Telemetry"),
     ("learning", "Learning"),
+    ("harness", "Harness"),
 ];
 
 #[derive(Clone, Debug)]
