@@ -1,0 +1,4 @@
+# A stray `cargo` run inside this crate must not litter the repo.
+# It does not build standalone — it needs the zed-mini-ork workspace.
+/target
+Cargo.lock
