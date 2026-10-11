@@ -187,6 +187,11 @@ pub struct MiniOrkPage {
     /// window (see `ensure_dag_graph`).
     dag_graph: Option<Entity<crate::graph::MiniOrkGraph>>,
     _graph_sub: Option<Subscription>,
+    /// The node tab last seen on the DAG graph. The page draws rows that follow
+    /// it (the pills row rides with Overview), so it re-renders when the tab
+    /// moves — and only then: the graph notifies for every stream poll, and the
+    /// sections should not be rebuilt for those.
+    seen_node_tab: String,
     /// Board reads this page has followed (it re-reads when the board moves).
     seen_board: u64,
     last_reload: std::time::Instant,
@@ -241,6 +246,7 @@ impl MiniOrkPage {
             pending_graph: None,
             dag_graph: None,
             _graph_sub: None,
+            seen_node_tab: String::new(),
             seen_board: 0,
             last_reload: std::time::Instant::now(),
             _store_sub: None,
@@ -661,6 +667,14 @@ impl MiniOrkPage {
         let sections = arr(page, "sections");
         let mut rows: Vec<AnyElement> = Vec::new();
         let mut group: Vec<(usize, &Value)> = Vec::new();
+        // The run-level pills row rides with the node Overview, so it is read
+        // once here rather than per section: the node tab can move while the
+        // page is on screen, and every row must agree on which tab is up.
+        let node_tab_is_overview = self
+            .dag_graph
+            .as_ref()
+            .map(|graph| graph.read(cx).active_tab() == "overview")
+            .unwrap_or(true);
         let flush = |group: &mut Vec<(usize, &Value)>, rows: &mut Vec<AnyElement>, this: &Self, window: &mut Window, cx: &mut Context<Self>| {
             if group.is_empty() {
                 return;
@@ -710,6 +724,18 @@ impl MiniOrkPage {
             if self.dag_graph.is_some()
                 && matches!(str_of(page, "tab").as_str(), "dag" | "graph")
                 && str_of(s, "type") == "inspector"
+            {
+                continue;
+            }
+            // The pills row is a summary of the whole run. It belongs beside
+            // the node Overview, where the reader is asking what happened at
+            // all; on a node's Stream or Changes tab they are reading that one
+            // node, and a model-family row under it is noise. Scoped to the DAG
+            // tab, the only place with node tabs for it to follow.
+            if self.dag_graph.is_some()
+                && matches!(str_of(page, "tab").as_str(), "dag" | "graph")
+                && str_of(s, "type") == "pills"
+                && !node_tab_is_overview
             {
                 continue;
             }
@@ -1725,6 +1751,19 @@ impl MiniOrkPage {
             graph.tab_mode = true;
             graph
         });
+        // The pills row rides with the node Overview, and the graph's own
+        // `notify` re-renders the graph rather than the page around it: follow
+        // the tab here so the row appears and goes with it. Compared first —
+        // the graph notifies for a stream poll too, and the page's sections
+        // should not be rebuilt for a tab that did not move.
+        cx.observe(&graph, |this, graph, cx| {
+            let tab = graph.read(cx).active_tab().to_string();
+            if tab != this.seen_node_tab {
+                this.seen_node_tab = tab;
+                cx.notify();
+            }
+        })
+        .detach();
         self.dag_graph = Some(graph);
         cx.notify();
     }

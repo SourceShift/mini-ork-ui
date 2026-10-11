@@ -1797,6 +1797,20 @@ impl MiniOrkGraph {
             .into_any_element()
     }
 
+    /// The active tab *is* the stream, so the DAG strip above it goes on its
+    /// own: the transcript is what the reader opened the tab for, and half a
+    /// tab spent on a DAG they already have is the box this view exists to
+    /// avoid. The ⤢ toggle has nothing left to toggle while this holds.
+    fn stream_takes_the_tab(&self) -> bool {
+        self.tab_mode && self.tab == "stream"
+    }
+
+    /// The node tab on screen (`overview`, `stream`, …). Read by the run page,
+    /// so a run-level row can ride with the node tab it belongs to.
+    pub(crate) fn active_tab(&self) -> &str {
+        &self.tab
+    }
+
     /// The agent's session, rendered the way Claude Code's terminal shows it.
     fn render_stream(&self, node: &Node, detail: &Value, live: bool, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let mono = p::mono_font(cx);
@@ -1879,7 +1893,10 @@ impl MiniOrkGraph {
                                 .tooltip_label("Copy transcript"),
                         )
                     })
-                    .child(
+                    // No toggle on a node tab's stream: that tab is the
+                    // full-screen case already, and a button that flips a flag
+                    // nothing reads is worse than no button.
+                    .children((!self.stream_takes_the_tab()).then(|| {
                         div()
                             .id("stream-full")
                             .flex_none()
@@ -1904,8 +1921,8 @@ impl MiniOrkGraph {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.stream_full = !this.stream_full;
                                 cx.notify();
-                            })),
-                    ),
+                            }))
+                    })),
             )
             .child(
                 h_flex()
@@ -2297,9 +2314,11 @@ impl Render for MiniOrkGraph {
                 }
             }
             // Full screen: the strip is dropped so the stream below gets the
-            // whole tab. Built only when it will be shown — the canvas lays out
-            // every node, and a hidden strip should not pay for that.
-            let dag = (!self.stream_full).then(|| {
+            // whole tab — and it goes the same way when the active tab *is* the
+            // stream, with no toggle to press. Built only when it will be shown:
+            // the canvas lays out every node, and a hidden strip should not pay
+            // for that.
+            let dag = (!self.stream_full && !self.stream_takes_the_tab()).then(|| {
                 div()
                     .id("node-tab-dag")
                     .flex_none()
