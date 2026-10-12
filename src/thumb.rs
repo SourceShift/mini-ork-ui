@@ -326,7 +326,7 @@ fn mark_colour(node: &TNode) -> gpui::Hsla {
 
 /// The colour of one edge, by what it means. `depends_on` is the backbone and
 /// stays quiet; the exceptions are the ones worth seeing at this size.
-fn edge_colour(kind: &str) -> gpui::Hsla {
+pub(crate) fn edge_colour(kind: &str) -> gpui::Hsla {
     match kind {
         "verifies" => c(p::PURPLE),
         "escalates_to" => c(p::YELLOW),

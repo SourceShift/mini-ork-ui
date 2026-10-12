@@ -68,6 +68,24 @@ pub struct Node {
     len: usize,
 }
 
+/// One declared edge, as the engine sends it: two node ids and the relationship
+/// between them. `kind` is empty only for the legacy fan-out (see `spans`).
+#[derive(Clone, Debug)]
+pub struct Edge {
+    pub from: String,
+    pub to: String,
+    pub kind: String,
+}
+
+/// One edge resolved to the two nodes it joins, so the paint closure can draw
+/// it without looking anything up.
+#[derive(Clone, Debug)]
+pub(crate) struct Span {
+    pub from: Node,
+    pub to: Node,
+    pub kind: String,
+}
+
 /// The graph as the run page's DAG section describes it.
 #[derive(Clone, Debug, Default)]
 pub struct Model {
@@ -77,6 +95,8 @@ pub struct Model {
     pub state: String,
     pub heads: Vec<String>,
     pub cols: Vec<Vec<Node>>,
+    /// The recipe's declared edges. Empty against an engine that predates them.
+    pub edges: Vec<Edge>,
 }
 
 impl Model {
@@ -86,11 +106,11 @@ impl Model {
         // (for example `"graph": null`) and the absent case both fall back to
         // the older `dag` section + `sub`/`chips` page fields, so the IDE
         // still runs against an engine that hasn't been upgraded.
-        let (cols_source, heads_source, recipe, title, state) = match page
+        let (cols_source, heads_source, edges_source, recipe, title, state) = match page
             .get("graph")
             .filter(|graph| graph.is_object())
         {
-            Some(graph) => (arr(graph, "cols"), arr(graph, "heads"), str_of(graph, "recipe"), str_of(graph, "run_title"), str_of(graph, "state")),
+            Some(graph) => (arr(graph, "cols"), arr(graph, "heads"), arr(graph, "edges"), str_of(graph, "recipe"), str_of(graph, "run_title"), str_of(graph, "state")),
             None => {
                 let dag = arr(page, "sections").into_iter().find(|s| str_of(s, "type") == "dag")?;
                 let sub = str_of(page, "sub");
@@ -100,7 +120,7 @@ impl Model {
                 let title = str_of(&dag, "run_title");
                 let title = if title.is_empty() { parts.next().unwrap_or_default().to_string() } else { title };
                 let state = arr(page, "chips").first().map(|c| str_of(c, "t")).unwrap_or_default();
-                (arr(&dag, "cols"), arr(&dag, "heads"), recipe, title, state)
+                (arr(&dag, "cols"), arr(&dag, "heads"), arr(&dag, "edges"), recipe, title, state)
             }
         };
         let mut cols: Vec<Vec<Node>> = Vec::new();
@@ -144,6 +164,25 @@ impl Model {
                     .collect()
             }
         };
+        // An edge the engine sent but the drawing has no room for (one end is a
+        // node the run never reached, or a node talking to itself) is dropped
+        // here rather than at paint time: `spans` walks the drawn nodes only.
+        let edges = edges_source
+            .into_iter()
+            .filter_map(|e| {
+                let from = str_of(&e, "from");
+                let to = str_of(&e, "to");
+                if from.is_empty() || to.is_empty() || from == to {
+                    return None;
+                }
+                let kind = str_of(&e, "edge_type");
+                Some(Edge {
+                    from,
+                    to,
+                    kind: if kind.is_empty() { "depends_on".to_string() } else { kind },
+                })
+            })
+            .collect();
         Some(Self {
             run_id: run_id.to_string(),
             recipe,
@@ -151,7 +190,37 @@ impl Model {
             state,
             heads,
             cols,
+            edges,
         })
+    }
+
+    /// The edges to draw, resolved to their endpoints.
+    ///
+    /// The engine sends the recipe's own edge list. An engine that predates it
+    /// sends none, and the fallback keeps the picture that engine's IDE drew:
+    /// every node of one column to every node of the next, which reads as a
+    /// graph even though it names no relationship.
+    pub(crate) fn spans(&self) -> Vec<Span> {
+        let by_id: HashMap<&str, &Node> = self.flat().into_iter().map(|n| (n.id.as_str(), n)).collect();
+        let mut spans: Vec<Span> = self
+            .edges
+            .iter()
+            .filter_map(|e| {
+                let from = *by_id.get(e.from.as_str())?;
+                let to = *by_id.get(e.to.as_str())?;
+                (from.id != to.id).then(|| Span { from: from.clone(), to: to.clone(), kind: e.kind.clone() })
+            })
+            .collect();
+        if spans.is_empty() {
+            for pair in self.cols.windows(2) {
+                for from in &pair[0] {
+                    for to in &pair[1] {
+                        spans.push(Span { from: from.clone(), to: to.clone(), kind: String::new() });
+                    }
+                }
+            }
+        }
+        spans
     }
 
     fn flat(&self) -> Vec<&Node> {
@@ -825,9 +894,10 @@ pub(crate) fn render_canvas(
     let (w, h) = (model.width() * z, model.height() * z);
     let mono = p::mono_font(cx);
 
-    // Edges: every node of one column to every node of the next, as in the
-    // design; the selected node's edges are blue, edges into pending nodes dim.
+    // Edges: the recipe's own list when the engine sends one, else the legacy
+    // fan-out. The selected node's edges are blue, edges into pending nodes dim.
     let edge_model = model.clone();
+    let edge_spans = model.spans();
     let edge_query = query.to_string();
     let edge_selected = selected.clone();
     let edges = canvas(
@@ -842,29 +912,69 @@ pub(crate) fn render_canvas(
                         .to_lowercase()
                         .contains(&edge_query)
             };
-            for ci in 0..edge_model.cols.len().saturating_sub(1) {
-                for a in &edge_model.cols[ci] {
-                    for b in &edge_model.cols[ci + 1] {
-                        let (ax, ay) = edge_model.pos(a);
-                        let (bx, by) = edge_model.pos(b);
-                        let (x1, y1, x2, y2) = (ax + NW, ay + NH / 2., bx, by + NH / 2.);
-                        let hot = edge_selected.as_deref().is_some_and(|s| s == a.id || s == b.id);
-                        let mut colour = if hot {
-                            c(p::BLUE)
-                        } else if b.state.is_empty() || b.state == "pending" {
-                            c(p::BORDER2)
-                        } else {
-                            c(p::DIM)
-                        };
-                        if !(matches(a) && matches(b)) {
-                            colour = colour.opacity(0.25);
-                        }
-                        let mut path = PathBuilder::stroke(px(if hot { 2. } else { 1.3 } * z.max(0.6)));
-                        path.move_to(at(x1, y1));
-                        path.cubic_bezier_to(at(x2, y2), at(x1 + 36., y1), at(x2 - 36., y2));
-                        if let Ok(path) = path.build() {
-                            window.paint_path(path, colour);
-                        }
+            for span in &edge_spans {
+                let (a, b) = (&span.from, &span.to);
+                let (ax, ay) = edge_model.pos(a);
+                let (bx, by) = edge_model.pos(b);
+                // A back edge is one the columns cannot express: the layout put
+                // its target at or before its source, because it is a loop and
+                // not a step. It leaves the bottom of the source, dips under the
+                // band and comes back up into the bottom of the target, drawn
+                // broken so it never reads as a forward step.
+                let back = b.col <= a.col;
+                let (x1, y1, x2, y2, c1x, c1y, c2x, c2y) = if back {
+                    let (x1, y1) = (ax + NW / 2., ay + NH);
+                    let (x2, y2) = (bx + NW / 2., by + NH);
+                    let dip = y1.max(y2) + 52.;
+                    (x1, y1, x2, y2, x1, dip, x2, dip)
+                } else {
+                    let (x1, y1) = (ax + NW, ay + NH / 2.);
+                    let (x2, y2) = (bx, by + NH / 2.);
+                    (x1, y1, x2, y2, x1 + 36., y1, x2 - 36., y2)
+                };
+                let hot = edge_selected.as_deref().is_some_and(|s| s == a.id || s == b.id);
+                let mut colour = if hot {
+                    c(p::BLUE)
+                } else if b.state.is_empty() || b.state == "pending" {
+                    c(p::BORDER2)
+                } else if span.kind.is_empty() {
+                    c(p::DIM)
+                } else {
+                    crate::thumb::edge_colour(&span.kind)
+                };
+                if !(matches(a) && matches(b)) {
+                    colour = colour.opacity(0.25);
+                }
+                let scale = z.max(0.6);
+                let mut path = PathBuilder::stroke(px(if hot { 2. } else { 1.3 } * scale));
+                if back {
+                    path = path.dash_array(&[px(5. * scale), px(4. * scale)]);
+                }
+                path.move_to(at(x1, y1));
+                path.cubic_bezier_to(at(x2, y2), at(c1x, c1y), at(c2x, c2y));
+                if let Ok(path) = path.build() {
+                    window.paint_path(path, colour);
+                }
+                // An arrowhead at the target: the one thing the old drawing
+                // could not show was which way an edge ran. Its direction is the
+                // curve's own end tangent, so it follows the arc round too.
+                let (dx, dy) = (x2 - c2x, y2 - c2y);
+                let length = (dx * dx + dy * dy).sqrt();
+                if length > 0.001 {
+                    let (ux, uy) = (dx / length, dy / length);
+                    let (px_, py_) = (-uy, ux);
+                    let (back_x, back_y) = (x2 - ux * 9., y2 - uy * 9.);
+                    let mut head = PathBuilder::fill();
+                    head.add_polygon(
+                        &[
+                            at(x2, y2),
+                            at(back_x + px_ * 4.5, back_y + py_ * 4.5),
+                            at(back_x - px_ * 4.5, back_y - py_ * 4.5),
+                        ],
+                        true,
+                    );
+                    if let Ok(head) = head.build() {
+                        window.paint_path(head, colour);
                     }
                 }
             }
@@ -2407,5 +2517,92 @@ fn human_size(bytes: u64) -> String {
         b if b < 1024 => format!("{b} B"),
         b if b < 1024 * 1024 => format!("{:.1} KB", b as f64 / 1024.),
         b => format!("{:.1} MB", b as f64 / (1024. * 1024.)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The page the engine serves for a three-column run, with `edges` as the
+    /// engine sent them.
+    fn page(edges: Value) -> Value {
+        json!({
+            "graph": {
+                "cols": [
+                    [{"id": "planner", "label": "planner"}],
+                    [{"id": "implementer", "label": "implementer"}],
+                    [{"id": "test", "label": "test"}],
+                ],
+                "heads": ["planner", "implementer", "test"],
+                "edges": edges,
+            }
+        })
+    }
+
+    fn model(edges: Value) -> Model {
+        Model::from_page(&page(edges), "run-1").expect("a graph object")
+    }
+
+    fn named(model: &Model) -> Vec<(String, String, String)> {
+        model
+            .spans()
+            .iter()
+            .map(|s| (s.from.id.clone(), s.to.id.clone(), s.kind.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn the_engines_edge_list_resolves_to_spans() {
+        let model = model(json!([
+            {"from": "planner", "to": "implementer", "edge_type": "depends_on"},
+            {"from": "implementer", "to": "test", "edge_type": "verifies"},
+        ]));
+        assert_eq!(
+            named(&model),
+            vec![
+                ("planner".into(), "implementer".into(), "depends_on".into()),
+                ("implementer".into(), "test".into(), "verifies".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_edge_without_a_kind_is_a_depends_on() {
+        let model = model(json!([{"from": "planner", "to": "implementer"}]));
+        assert_eq!(named(&model)[0].2, "depends_on");
+    }
+
+    /// `epic-runner`'s `reflector → epic_dispatcher` revise edge: the target
+    /// sits in an earlier column, which is exactly the test the canvas uses to
+    /// route an edge as a back arc instead of a forward step.
+    #[test]
+    fn a_retry_edge_lands_on_an_earlier_column() {
+        let model = model(json!([{"from": "test", "to": "implementer", "edge_type": "retries"}]));
+        let spans = model.spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].kind, "retries");
+        assert!(spans[0].to.col <= spans[0].from.col, "drawn as a back arc");
+    }
+
+    #[test]
+    fn a_dangling_or_self_edge_is_not_drawn() {
+        let model = model(json!([
+            {"from": "planner", "to": "ghost", "edge_type": "depends_on"},
+            {"from": "planner", "to": "planner", "edge_type": "retries"},
+            {"from": "planner", "to": "implementer", "edge_type": "depends_on"},
+        ]));
+        assert_eq!(model.edges.len(), 2, "the self edge never leaves the parser");
+        assert_eq!(named(&model), vec![("planner".into(), "implementer".into(), "depends_on".into())]);
+    }
+
+    /// An engine that predates the edge list sends `[]`: the drawing must fall
+    /// back to the fan-out it used to invent, not come out empty.
+    #[test]
+    fn an_engine_without_edges_still_draws_the_fan_out() {
+        let model = model(json!([]));
+        assert!(model.edges.is_empty());
+        assert_eq!(model.spans().len(), 2, "one node per column, so one edge per gap");
     }
 }
