@@ -35,6 +35,11 @@ const NW: f32 = 176.;
 const NH: f32 = 76.;
 const GX: f32 = 74.;
 const GY: f32 = 18.;
+/// How far below the node band a back edge is routed. The curve only reaches
+/// about three quarters of its control points, but the drawing has to reserve
+/// room for the whole arc or the deepest point of it falls outside the canvas.
+const BACK_ARC_DIP: f32 = 52.;
+const BACK_ARC_ROOM: f32 = 48.;
 const STREAM_POLL: Duration = Duration::from_millis(1500);
 /// Height of the DAG strip at the top of a node tab — enough for a recipe's
 /// deepest column plus its head labels, without crowding the detail below.
@@ -249,7 +254,26 @@ impl Model {
     }
 
     fn height(&self) -> f32 {
-        26. + self.max_rows() as f32 * (NH + GY) - GY
+        let band = 26. + self.max_rows() as f32 * (NH + GY) - GY;
+        // A back edge is drawn under the band, so the drawing is taller than
+        // the nodes are and the container has to be told.
+        if self.has_back_edge() { band + BACK_ARC_ROOM } else { band }
+    }
+
+    /// Whether any declared edge runs backwards — its target at or before its
+    /// source, which is what a revise loop looks like once the columns have
+    /// been laid out. Those are the edges the canvas routes beneath the band.
+    fn has_back_edge(&self) -> bool {
+        let col_of: HashMap<&str, usize> = self
+            .cols
+            .iter()
+            .enumerate()
+            .flat_map(|(i, col)| col.iter().map(move |n| (n.id.as_str(), i)))
+            .collect();
+        self.edges.iter().any(|e| match (col_of.get(e.from.as_str()), col_of.get(e.to.as_str())) {
+            (Some(&from), Some(&to)) => to <= from && e.from != e.to,
+            _ => false,
+        })
     }
 
     fn pos(&self, n: &Node) -> (f32, f32) {
@@ -925,7 +949,7 @@ pub(crate) fn render_canvas(
                 let (x1, y1, x2, y2, c1x, c1y, c2x, c2y) = if back {
                     let (x1, y1) = (ax + NW / 2., ay + NH);
                     let (x2, y2) = (bx + NW / 2., by + NH);
-                    let dip = y1.max(y2) + 52.;
+                    let dip = y1.max(y2) + BACK_ARC_DIP;
                     (x1, y1, x2, y2, x1, dip, x2, dip)
                 } else {
                     let (x1, y1) = (ax + NW, ay + NH / 2.);
@@ -2604,5 +2628,15 @@ mod tests {
         let model = model(json!([]));
         assert!(model.edges.is_empty());
         assert_eq!(model.spans().len(), 2, "one node per column, so one edge per gap");
+    }
+
+    /// The back arc is drawn under the band, so the canvas has to be taller
+    /// than the nodes are — otherwise its deepest point is clipped away and
+    /// the loop disappears again.
+    #[test]
+    fn a_back_edge_reserves_room_under_the_band() {
+        let forward = model(json!([{"from": "planner", "to": "implementer", "edge_type": "depends_on"}]));
+        let loopy = model(json!([{"from": "test", "to": "implementer", "edge_type": "retries"}]));
+        assert!(loopy.height() > forward.height(), "the arc needs room below the nodes");
     }
 }
