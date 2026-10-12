@@ -58,6 +58,11 @@ fn show_board(workspace: &WeakEntity<Workspace>, cx: &mut App) {
     with_sidebar(workspace, cx, |sidebar, cx| sidebar.show_board(cx));
 }
 
+/// Run `f` on the rail, wherever the host mounted it.
+///
+/// The rail is a `Sidebar`, but a host that wants the project sidebar — and
+/// with it Zed's thread list — registers it in a dock instead (see the `Panel`
+/// impl in `sidebar.rs`). Both mountings are live, so look in both places.
 fn with_sidebar(
     workspace: &WeakEntity<Workspace>,
     cx: &mut App,
@@ -66,17 +71,21 @@ fn with_sidebar(
     let Some(workspace) = workspace.upgrade() else {
         return;
     };
-    let Some(mw) = workspace.read(cx).multi_workspace().and_then(|mw| mw.upgrade()) else {
+    let rail = workspace
+        .read(cx)
+        .multi_workspace()
+        .and_then(|multi_workspace| multi_workspace.upgrade())
+        .and_then(|multi_workspace| {
+            multi_workspace
+                .read(cx)
+                .sidebar()
+                .and_then(|sidebar| sidebar.to_any().downcast::<MiniOrkSidebar>().ok())
+        })
+        .or_else(|| workspace.read(cx).panel::<MiniOrkSidebar>(cx));
+    let Some(rail) = rail else {
         return;
     };
-    let sidebar = mw
-        .read(cx)
-        .sidebar()
-        .and_then(|s| s.to_any().downcast::<MiniOrkSidebar>().ok());
-    if let Some(sidebar) = sidebar {
-        sidebar.update(cx, f);
-        mw.update(cx, |_, cx| cx.notify());
-    }
+    rail.update(cx, f);
 }
 
 impl Render for MiniOrkStatus {

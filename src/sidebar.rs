@@ -11,7 +11,7 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Pixels,
+    Action, AnyElement, App, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Pixels,
     Render, ScrollHandle, SharedString, Subscription, Task, WeakEntity, Window, WindowControlArea, px,
 };
 use ui_input::{ERASED_EDITOR_FACTORY, ErasedEditor, ErasedEditorEvent};
@@ -20,7 +20,11 @@ use ui::{
     PopoverMenu, Tooltip, prelude::*,
     utils::{TRAFFIC_LIGHT_PADDING, platform_title_bar_height},
 };
-use workspace::{MultiWorkspace, MultiWorkspaceEvent, Sidebar, SidebarEvent, SidebarSide, Workspace};
+use workspace::{
+    MultiWorkspace, MultiWorkspaceEvent, Sidebar, SidebarEvent, SidebarSide, ToggleLeftDock,
+    Workspace,
+    dock::{DockPosition, Panel, PanelEvent},
+};
 
 use crate::{
     board::{self, Board, Run},
@@ -177,7 +181,11 @@ impl MiniOrkSidebar {
                 cx.notify();
             }
         });
-        // The sidebar is the IDE's activity bar: keep it open.
+        // The IDE wants both rails up at start-up — this one, and the project
+        // sidebar that carries the file tree and the thread list. A workspace's
+        // sidebar starts closed and only reopens from persisted state, so open
+        // it once here rather than leaving a fresh window with the rail and no
+        // project list beside it.
         let handle = multi_workspace.downgrade();
         cx.defer(move |cx| {
             handle
@@ -1493,6 +1501,75 @@ impl Sidebar for MiniOrkSidebar {
             }
             cx.notify();
         }
+    }
+}
+
+impl EventEmitter<PanelEvent> for MiniOrkSidebar {}
+
+/// The rail is a dock panel as well as a sidebar, so the IDE can put it in the
+/// left dock and leave the project sidebar — the file tree and, importantly,
+/// the thread list — in the sidebar slot. `crates/zed` mounts it this way; the
+/// `Sidebar` impl above is what a host that wants it in the sidebar slot uses.
+impl Panel for MiniOrkSidebar {
+    fn persistent_name() -> &'static str {
+        "Mini-ork"
+    }
+
+    fn panel_key() -> &'static str {
+        "MiniOrkSidebar"
+    }
+
+    fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
+        DockPosition::Left
+    }
+
+    fn position_is_valid(&self, position: DockPosition) -> bool {
+        matches!(position, DockPosition::Left | DockPosition::Right)
+    }
+
+    /// The rail never remembers a dock side: `position` is always
+    /// [`DockPosition::Left`], so a drag that would move it is dropped rather
+    /// than written to a setting this crate does not own.
+    fn set_position(
+        &mut self,
+        _position: DockPosition,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    fn default_size(&self, _window: &Window, cx: &App) -> Pixels {
+        let rem = theme::theme_settings(cx).ui_font_size(cx);
+        let design = if self.board_open { ACTIVITY_WIDTH + self.board_width } else { ACTIVITY_WIDTH };
+        rems_from_px(design).to_pixels(rem)
+    }
+
+    /// The rail alone — the board is the part that folds away.
+    fn min_size(&self, _window: &Window, cx: &App) -> Option<Pixels> {
+        let rem = theme::theme_settings(cx).ui_font_size(cx);
+        Some(rems_from_px(ACTIVITY_WIDTH).to_pixels(rem))
+    }
+
+    fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
+        Some(IconName::Sparkle)
+    }
+
+    fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
+        Some("mini-ork")
+    }
+
+    fn toggle_action(&self) -> Box<dyn Action> {
+        Box::new(ToggleLeftDock)
+    }
+
+    /// The rail is the IDE's activity bar — a window without it has no way to
+    /// reach the mini-ork pages, so it opens with the workspace.
+    fn starts_open(&self, _window: &Window, _cx: &App) -> bool {
+        true
+    }
+
+    fn activation_priority(&self) -> u32 {
+        4
     }
 }
 
