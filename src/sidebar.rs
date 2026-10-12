@@ -1,8 +1,14 @@
 //! The left edge of the mini-ork IDE: the activity bar and the Threads board.
 //!
-//! It fills Zed's pluggable workspace sidebar slot (`workspace::Sidebar`), so
-//! it sits left of the docks, full height. Its top strip continues the title
-//! bar (project, branch) under the window's traffic lights.
+//! It fills Zed's pluggable workspace sidebar slot (`workspace::Sidebar`) and
+//! is a dock panel of the left dock (`workspace::dock::Panel`), because the two
+//! are not interchangeable: the sidebar slot is where Zed's own thread list
+//! lives, and a rail that takes that slot is a rail that hides it. The IDE
+//! mounts the rail in the dock and leaves the slot to `workspace::Sidebar`;
+//! the `Sidebar` impl stays for a host that wants the rail in the slot anyway.
+//!
+//! Its top strip continues the title bar (project, branch) under the window's
+//! traffic lights.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -10,6 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use agent_ui::thread_metadata_store::{ThreadMetadata, ThreadMetadataStore};
 use gpui::{
     Action, AnyElement, App, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Pixels,
     Render, ScrollHandle, SharedString, Subscription, Task, WeakEntity, Window, WindowControlArea, px,
@@ -33,6 +40,7 @@ use crate::{
     palette::{self as p, c},
     projects,
     store::{self, BoardStore},
+    threads,
     thumb,
 };
 
@@ -141,6 +149,9 @@ pub struct MiniOrkSidebar {
     _store: Option<Subscription>,
     _workspace: Option<Subscription>,
     _multi: Subscription,
+    /// Zed's thread store, so a thread created in the agent panel appears in the
+    /// board without waiting for the next poll.
+    _threads: Option<Subscription>,
 }
 
 impl MiniOrkSidebar {
@@ -196,6 +207,8 @@ impl MiniOrkSidebar {
                 })
                 .ok();
         });
+        let threads = ThreadMetadataStore::try_global(cx)
+            .map(|store| cx.observe(&store, |_, _, cx| cx.notify()));
         Self {
             multi_workspace: multi_workspace.downgrade(),
             focus_handle: cx.focus_handle(),
@@ -225,6 +238,7 @@ impl MiniOrkSidebar {
             _store: None,
             _workspace: None,
             _multi: multi,
+            _threads: threads,
         }
     }
 
@@ -791,6 +805,16 @@ impl MiniOrkSidebar {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let runs: Vec<Run> = self.visible_runs(board);
+        // The engine's runs are not the only threads of this project: the ones
+        // the agent panel created live in Zed's own store, and a board that
+        // listed runs alone made a thread you had just started look like it had
+        // never existed.
+        let zed_threads = match workspace.as_ref() {
+            Some(workspace) => {
+                threads::for_root(projects::current_root(workspace, cx).as_deref(), cx)
+            }
+            None => Vec::new(),
+        };
         let counts = board.map(|b| b.counts.clone()).unwrap_or_default();
         let header = {
             let workspace = workspace.clone();
@@ -954,6 +978,23 @@ impl MiniOrkSidebar {
                     .on_click(cx.listener(|this, _, _, cx| this.load_more(cx))),
             );
         }
+        // Zed's own threads come after the engine's runs: the board's tiles and
+        // groups count runs, and a thread is opened where it was written — in
+        // the agent panel — rather than given a board of its own here.
+        if !zed_threads.is_empty() {
+            list = list.child(
+                ListHeader::new(format!("Agent threads · {}", zed_threads.len()))
+                    .start_slot(
+                        div()
+                            .text_size(rems_from_px(11_f32))
+                            .text_color(c(p::SUB))
+                            .child("◍"),
+                    ),
+            );
+            for thread in &zed_threads {
+                list = list.child(self.render_zed_thread(thread, now, workspace, cx));
+            }
+        }
         let scroll = self.list_scroll.clone();
         v_flex()
             .flex_none()
@@ -985,6 +1026,88 @@ impl MiniOrkSidebar {
 }
 
 impl MiniOrkSidebar {
+    /// One of Zed's own agent threads, drawn like a run: the mark, the title,
+    /// and who wrote it. Clicking opens it in the agent panel — the thread
+    /// lives there, and the board is a way in, never a second copy of it.
+    fn render_zed_thread(
+        &self,
+        thread: &ThreadMetadata,
+        now: i64,
+        workspace: &Option<Entity<Workspace>>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let touched = thread.interacted_at.unwrap_or(thread.updated_at).timestamp();
+        let open = {
+            let thread = thread.clone();
+            let workspace = workspace.clone();
+            cx.listener(move |_, _, window, cx| {
+                if let Some(workspace) = workspace.as_ref() {
+                    threads::open(workspace, &thread, true, window, cx);
+                }
+            })
+        };
+        let head = h_flex()
+            .w_full()
+            .gap_2()
+            .child(
+                div()
+                    .w_3p5()
+                    .flex_none()
+                    .flex()
+                    .justify_center()
+                    .child(Label::new("◍").size(LabelSize::XSmall).color(Color::Placeholder)),
+            )
+            .child(
+                Label::new(thread.display_title())
+                    .flex_1()
+                    .size(LabelSize::Small)
+                    .color(Color::Default)
+                    .truncate(),
+            )
+            .child(
+                Label::new(age(Some(touched), now))
+                    .flex_none()
+                    .size(LabelSize::XSmall)
+                    .color(Color::Placeholder)
+                    .buffer_font(cx),
+            );
+        let sub_line = h_flex()
+            .w_full()
+            .pl(rems_from_px(22_f32))
+            .gap_1p5()
+            .child(
+                Label::new(thread.agent_id.to_string())
+                    .flex_1()
+                    .size(LabelSize::XSmall)
+                    .color(Color::Placeholder)
+                    .truncate(),
+            )
+            // A draft has no session yet, so "2m ago" would read as work that
+            // happened when nothing has been sent.
+            .when(thread.is_draft(), |this| {
+                this.child(
+                    Label::new("draft")
+                        .flex_none()
+                        .size(LabelSize::XSmall)
+                        .color(Color::Placeholder),
+                )
+            });
+        div()
+            .w_full()
+            .border_b_1()
+            .border_color(c(p::BORDER))
+            .child(
+                ListItem::new(SharedString::from(format!(
+                    "board-thread-{}",
+                    thread.thread_id.to_key_string()
+                )))
+                .selectable(true)
+                .on_click(open)
+                .child(v_flex().w_full().gap_0p5().child(head).child(sub_line)),
+            )
+            .into_any_element()
+    }
+
     /// One run, drawn like Orca draws its sessions: a status mark (a spinner
     /// while working), the title and a dim subtitle. The selected run and the
     /// ones still in flight open into a card that lists their nodes — status,
