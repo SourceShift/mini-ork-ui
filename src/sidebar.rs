@@ -1,11 +1,16 @@
-//! The left edge of the mini-ork IDE: the activity bar and the Threads board.
+//! The mini-ork rail: the activity bar and the Threads board.
 //!
 //! It fills Zed's pluggable workspace sidebar slot (`workspace::Sidebar`) and
-//! is a dock panel of the left dock (`workspace::dock::Panel`), because the two
-//! are not interchangeable: the sidebar slot is where Zed's own thread list
-//! lives, and a rail that takes that slot is a rail that hides it. The IDE
-//! mounts the rail in the dock and leaves the slot to `workspace::Sidebar`;
-//! the `Sidebar` impl stays for a host that wants the rail in the slot anyway.
+//! is a dock panel (`workspace::dock::Panel`), because the two are not
+//! interchangeable: the sidebar slot is where Zed's own thread list lives, and
+//! a rail that takes that slot is a rail that hides it. The IDE mounts the rail
+//! in the right dock and leaves the slot to `workspace::Sidebar`; the `Sidebar`
+//! impl stays for a host that wants the rail in the slot anyway.
+//!
+//! The right dock and not the left: the left dock holds the agent panel, whose
+//! threads the board exists to list, and only one panel of a dock is on screen
+//! at a time — sharing the left dock would make the rail and the panel it
+//! summarises take turns.
 //!
 //! Its top strip continues the title bar (project, branch) under the window's
 //! traffic lights.
@@ -28,7 +33,7 @@ use ui::{
     utils::{TRAFFIC_LIGHT_PADDING, platform_title_bar_height},
 };
 use workspace::{
-    MultiWorkspace, MultiWorkspaceEvent, Sidebar, SidebarEvent, SidebarSide, ToggleLeftDock,
+    MultiWorkspace, MultiWorkspaceEvent, Sidebar, SidebarEvent, SidebarSide, ToggleRightDock,
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
 };
@@ -1629,10 +1634,11 @@ impl Sidebar for MiniOrkSidebar {
 
 impl EventEmitter<PanelEvent> for MiniOrkSidebar {}
 
-/// The rail is a dock panel as well as a sidebar, so the IDE can put it in the
-/// left dock and leave the project sidebar — the file tree and, importantly,
-/// the thread list — in the sidebar slot. `crates/zed` mounts it this way; the
-/// `Sidebar` impl above is what a host that wants it in the sidebar slot uses.
+/// The rail is a dock panel as well as a sidebar, so the IDE can put it in a
+/// dock and leave the project sidebar — the file tree and, importantly, the
+/// thread list — in the sidebar slot. `crates/zed` mounts it in the right dock;
+/// the `Sidebar` impl above is what a host that wants it in the sidebar slot
+/// uses.
 impl Panel for MiniOrkSidebar {
     fn persistent_name() -> &'static str {
         "Mini-ork"
@@ -1643,15 +1649,15 @@ impl Panel for MiniOrkSidebar {
     }
 
     fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
-        DockPosition::Left
+        DockPosition::Right
     }
 
     fn position_is_valid(&self, position: DockPosition) -> bool {
-        matches!(position, DockPosition::Left | DockPosition::Right)
+        position == DockPosition::Right
     }
 
     /// The rail never remembers a dock side: `position` is always
-    /// [`DockPosition::Left`], so a drag that would move it is dropped rather
+    /// [`DockPosition::Right`], so a drag that would move it is dropped rather
     /// than written to a setting this crate does not own.
     fn set_position(
         &mut self,
@@ -1682,11 +1688,12 @@ impl Panel for MiniOrkSidebar {
     }
 
     fn toggle_action(&self) -> Box<dyn Action> {
-        Box::new(ToggleLeftDock)
+        Box::new(ToggleRightDock)
     }
 
-    /// The rail is the IDE's activity bar — a window without it has no way to
-    /// reach the mini-ork pages, so it opens with the workspace.
+    /// The rail is the IDE's activity bar and the only list of the engine's
+    /// runs and the agent threads beside them — a window without it has neither,
+    /// so it opens with the workspace.
     fn starts_open(&self, _window: &Window, _cx: &App) -> bool {
         true
     }

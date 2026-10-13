@@ -16,7 +16,10 @@ use serde_json::Value;
 use util::ResultExt as _;
 use workspace::{OpenOptions, Toast, Workspace, notifications::NotificationId};
 
-use crate::board::{self, Board};
+use crate::{
+    board::{self, Board},
+    sidebar::MiniOrkSidebar,
+};
 
 /// The board is re-read when mini-ork writes to the project's `.mini-ork`
 /// (state.db, its WAL, run folders) — never on a fixed beat. Reads are at least
@@ -112,8 +115,8 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
-/// The design's layout once the window has loaded: the mini-ork thread in the
-/// left dock, nothing in the right dock. `MINI_ORK_IDE_OPEN` (comma-separated
+/// The design's layout once the window has loaded: the agent panel in the left
+/// dock, the rail in the right one. `MINI_ORK_IDE_OPEN` (comma-separated
 /// `key[:tab]`, `run:<id>[:tab][:graph[:node]]` or `run:latest…`) also opens pages —
 /// for checking the IDE without clicking through it.
 fn startup_layout(window: &mut Window, cx: &mut Context<Workspace>) {
@@ -138,9 +141,13 @@ fn startup_layout(window: &mut Window, cx: &mut Context<Workspace>) {
         workspace
             .update_in(cx, |workspace, window, cx| {
                 workspace.open_panel::<agent_ui::AgentPanel>(window, cx);
-                workspace
-                    .right_dock()
-                    .update(cx, |dock, cx| dock.set_open(false, window, cx));
+                // The rail's own dock opens with it (`starts_open`), but that
+                // runs when the panel is added and this runs later, once the
+                // first board read has landed. Opening it again here is what
+                // keeps the dock from sitting on a panel that is not there yet
+                // — and what replaced the `set_open(false)` that used to hide
+                // the rail outright.
+                workspace.open_panel::<MiniOrkSidebar>(window, cx);
                 let Ok(spec) = std::env::var("MINI_ORK_IDE_OPEN") else {
                     return;
                 };

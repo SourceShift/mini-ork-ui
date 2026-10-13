@@ -3,12 +3,12 @@
 //! Everything mini-ork-specific in the IDE lives in this crate. Zed's own
 //! sources are touched only by the small hook commit that registers the crate
 //! (workspace `Cargo.toml`, `crates/zed/Cargo.toml`), calls [`init`] and mounts
-//! [`MiniOrkSidebar`] in the left dock — so a Zed upgrade is a rebase of that
+//! [`MiniOrkSidebar`] in the right dock — so a Zed upgrade is a rebase of that
 //! hook commit, and API drift stays inside this crate. The rail is a `Sidebar`
 //! as well as a `Panel`: a host that wants it in the sidebar slot still can,
 //! but the slot that carries Zed's thread list is no longer the rail's.
 //!
-//! - `sidebar`: activity bar + Threads board (a left-dock panel)
+//! - `sidebar`: activity bar + Threads board (a right-dock panel)
 //! - `threads`: Zed's own agent threads, read from `agent_ui`'s thread store
 //! - `title_bar`: replaces Zed's title bar item
 //! - `status`: status bar items
@@ -48,7 +48,8 @@ use settings::{MergeFromTrait as _, SettingsContent, SettingsStore};
 /// shared with stock Zed and are never written). Every dock button keeps its
 /// stock Zed default, so the status bar carries the same panel toggles: the
 /// activity bar is mini-ork's own drawer and does not stand in for them. The
-/// agent panel starts in the left dock, beside the mini-ork thread.
+/// agent panel starts in the left dock; the rail and its boards take the right
+/// one, so both are on screen at once.
 const IDE_DEFAULTS: &str = r#"{
   "agent": { "dock": "left" }
 }"#;
