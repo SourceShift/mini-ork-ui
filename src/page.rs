@@ -162,6 +162,10 @@ pub struct MiniOrkPage {
     /// a node tab draws, so it drags the same way; the state has to live on the
     /// page because the page — not a `MiniOrkGraph` — is what renders it here.
     dag_drag: std::rc::Rc<std::cell::Cell<Option<(gpui::Point<gpui::Pixels>, gpui::Point<gpui::Pixels>)>>>,
+    /// The DAG canvas' picked edge, by its two node ids, for the same reason
+    /// `dag_drag` lives here: the page renders the canvas, so the pick it sets
+    /// has to be kept by the page. `None` is the plain drawing.
+    dag_edge: Option<(String, String)>,
     /// The run flow map scrolls sideways over its own track.
     flow_scroll: ScrollHandle,
     /// The Graph tab's Steps · Flow map toggle: true draws the flow map and
@@ -237,6 +241,7 @@ impl MiniOrkPage {
             fade: 0,
             dag_scroll: ScrollHandle::new(),
             dag_drag: Default::default(),
+            dag_edge: None,
             flow_scroll: ScrollHandle::new(),
             show_flow_map: false,
             flow_focus: None,
@@ -1392,6 +1397,19 @@ impl MiniOrkPage {
                 let on_node = std::rc::Rc::new(move |node: &str, window: &mut Window, cx: &mut App| {
                     page.update(cx, |this, cx| this.open_node_tab(node.to_string(), window, cx)).ok();
                 });
+                // Picking an edge here is the canvas' own reading aid, so it
+                // only re-draws the DAG: it opens nothing.
+                let edge_page = cx.entity().downgrade();
+                let on_edge = std::rc::Rc::new(
+                    move |edge: Option<(String, String)>, _: &mut Window, cx: &mut App| {
+                        edge_page
+                            .update(cx, |this, cx| {
+                                this.dag_edge = edge;
+                                cx.notify();
+                            })
+                            .ok();
+                    },
+                );
                 div()
                     .id(("dag-scroll", index))
                     .relative()
@@ -1405,7 +1423,9 @@ impl MiniOrkPage {
                         "",
                         &self.dag_scroll,
                         &self.dag_drag,
+                        self.dag_edge.clone(),
                         on_node,
+                        on_edge,
                         cx,
                     ))
             }
