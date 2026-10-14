@@ -2874,4 +2874,83 @@ mod tests {
         let loopy = model(json!([{"from": "test", "to": "implementer", "edge_type": "retries"}]));
         assert!(loopy.height() > forward.height(), "the arc needs room below the nodes");
     }
+
+    /// Three nodes of one column into one node of the next: the fan-in the old
+    /// drawing got wrong, because every edge left its source and arrived at its
+    /// target at the same point, so the three drew as one thick line.
+    #[test]
+    fn a_fan_into_one_node_gives_every_edge_a_port_of_its_own() {
+        let model = Model::from_page(&fan_page(), "run-1").expect("a graph object");
+        let routes = model.routes();
+        assert_eq!(routes.len(), 3);
+        let arrival = |from: &str| {
+            routes
+                .iter()
+                .find(|route| route.span.from.id == from)
+                .expect("a route out of that node")
+                .points
+                .last()
+                .copied()
+                .expect("a route has two ends")
+                .1
+        };
+        let (a, b, c) = (arrival("a"), arrival("b"), arrival("c"));
+        assert!(a < b && b < c, "the fan keeps the order of the nodes it feeds from");
+    }
+
+    /// Two loops into different stages: each takes a lane of the rail, they do
+    /// not share one, and the canvas is deep enough to hold the deeper lane.
+    #[test]
+    fn two_loops_take_a_lane_each_under_the_band() {
+        let one = model(json!([{"from": "test", "to": "implementer", "edge_type": "retries"}]));
+        let two = model(json!([
+            {"from": "test", "to": "implementer", "edge_type": "retries"},
+            {"from": "test", "to": "planner", "edge_type": "retries"},
+        ]));
+        let lanes: Vec<f32> = two
+            .routes()
+            .iter()
+            .map(|route| route.points[1].1)
+            .collect();
+        assert_ne!(lanes[0], lanes[1], "two loops do not run in one lane");
+        assert!(two.height() > one.height(), "the deeper lane needs room");
+        assert!(lanes.iter().all(|y| *y > two.band() && *y < two.height()), "the lanes run under the band, inside the canvas");
+    }
+
+    /// An edge is pickable along its line, with a few pixels of slack, and a
+    /// click inside a node belongs to the node — the canvas paints the node over
+    /// the edge that runs under it, so it has to read the click the same way.
+    #[test]
+    fn an_edge_is_picked_along_its_line_and_not_through_a_node() {
+        let model = model(json!([{"from": "planner", "to": "implementer", "edge_type": "depends_on"}]));
+        let routes = model.routes();
+        let route = routes.first().expect("a route");
+        let (start_x, start_y) = route.points[0];
+        let end_y = route.points.last().expect("an end").1;
+        let middle = (start_x + 20., (start_y + end_y) / 2.);
+        assert_eq!(
+            route_at(&routes, &model, middle.0, middle.1, 2.),
+            Some(("planner".into(), "implementer".into()))
+        );
+        assert_eq!(route_at(&routes, &model, middle.0, middle.1 + 40., 2.), None, "40px away is not the edge");
+        assert_eq!(route_at(&routes, &model, start_x - 10., middle.1, 2.), None, "that point is inside the source node");
+    }
+
+    /// One column of three nodes feeding one node of the next.
+    fn fan_page() -> Value {
+        json!({
+            "graph": {
+                "cols": [
+                    [{"id": "a", "label": "a"}, {"id": "b", "label": "b"}, {"id": "c", "label": "c"}],
+                    [{"id": "synth", "label": "synth"}],
+                ],
+                "heads": ["judges", "synth"],
+                "edges": [
+                    {"from": "a", "to": "synth", "edge_type": "depends_on"},
+                    {"from": "b", "to": "synth", "edge_type": "depends_on"},
+                    {"from": "c", "to": "synth", "edge_type": "depends_on"},
+                ],
+            }
+        })
+    }
 }
