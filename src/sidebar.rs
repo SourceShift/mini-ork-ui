@@ -1735,8 +1735,14 @@ impl Render for MiniOrkSidebar {
                     .flex_1()
                     .min_h_0()
                     .items_stretch()
-                    .child(activity)
-                    .children(board_column),
+                    // The rail trails the board so it anchors the panel's outer
+                    // edge — the side a right-docked panel is read from. Both
+                    // columns carry `border_r_1`, so each one's right border
+                    // still falls where it did: the board's on the rail seam,
+                    // the rail's on the dock seam. Reordering needs no border
+                    // change, and the width math is a sum either way.
+                    .children(board_column)
+                    .child(activity),
             )
     }
 }
