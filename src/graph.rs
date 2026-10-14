@@ -35,11 +35,23 @@ const NW: f32 = 176.;
 const NH: f32 = 76.;
 const GX: f32 = 74.;
 const GY: f32 = 18.;
-/// How far below the node band a back edge is routed. The curve only reaches
-/// about three quarters of its control points, but the drawing has to reserve
-/// room for the whole arc or the deepest point of it falls outside the canvas.
-const BACK_ARC_DIP: f32 = 52.;
-const BACK_ARC_ROOM: f32 = 48.;
+/// The rail under the node band: an edge the columns cannot draw as a step — a
+/// `retries` loop back to an earlier stage, or a forward edge that skips one —
+/// leaves its node, drops into this band and runs along it. Each such edge takes
+/// a lane of its own, so no two of them ever draw over one another, and the
+/// canvas reserves room for the deepest lane.
+const RAIL_TOP_GAP: f32 = 34.;
+const RAIL_LANE_GAP: f32 = 14.;
+const RAIL_BOTTOM_PAD: f32 = 16.;
+/// How far past a node's own column an edge that skips a stage runs before it
+/// turns down, so its stub clears the nodes in between instead of crossing them.
+const DETOUR: f32 = GX / 2.;
+/// The felt around the graph inside the scroll container.
+const CANVAS_PAD: f32 = 28.;
+/// How near a click has to land to an edge to pick it, in screen pixels. The hit
+/// test divides it by the zoom, so picking an edge is as easy on a graph fitted
+/// to half its size as on one at 1:1.
+const EDGE_HIT: f32 = 5.;
 const STREAM_POLL: Duration = Duration::from_millis(1500);
 /// Height of the DAG strip at the top of a node tab — enough for a recipe's
 /// deepest column plus its head labels, without crowding the detail below.
@@ -89,6 +101,20 @@ pub(crate) struct Span {
     pub from: Node,
     pub to: Node,
     pub kind: String,
+}
+
+/// One edge resolved to the polyline the canvas paints for it: the two nodes it
+/// joins and the corners between them (see `Model::routes`). Every segment is
+/// straight, and each end sits on a port of its own, so two edges meeting at one
+/// node never draw over each other.
+#[derive(Clone, Debug)]
+pub(crate) struct Route {
+    pub span: Span,
+    pub points: Vec<(f32, f32)>,
+    /// A loop rather than a step: a `retries` edge back to an earlier stage, or
+    /// one that ends level with where it started. Drawn broken, so it never
+    /// reads as progress.
+    pub back: bool,
 }
 
 /// The graph as the run page's DAG section describes it.
@@ -254,26 +280,110 @@ impl Model {
     }
 
     fn height(&self) -> f32 {
-        let band = 26. + self.max_rows() as f32 * (NH + GY) - GY;
-        // A back edge is drawn under the band, so the drawing is taller than
-        // the nodes are and the container has to be told.
-        if self.has_back_edge() { band + BACK_ARC_ROOM } else { band }
+        // A detouring edge is drawn below the band, so the drawing is taller
+        // than the nodes are and the container has to be told: the deepest lane
+        // is what the canvas must fit.
+        let rails = self.rail_count();
+        if rails == 0 {
+            self.band()
+        } else {
+            self.band() + RAIL_TOP_GAP + (rails - 1) as f32 * RAIL_LANE_GAP + RAIL_BOTTOM_PAD
+        }
     }
 
-    /// Whether any declared edge runs backwards — its target at or before its
-    /// source, which is what a revise loop looks like once the columns have
-    /// been laid out. Those are the edges the canvas routes beneath the band.
-    fn has_back_edge(&self) -> bool {
-        let col_of: HashMap<&str, usize> = self
-            .cols
-            .iter()
+    /// The bottom of the lowest node, and so the top of the rail beneath it.
+    fn band(&self) -> f32 {
+        26. + self.max_rows() as f32 * (NH + GY) - GY
+    }
+
+    /// How many edges need a lane of the rail: the ones the columns cannot
+    /// express as a step. Counted rather than detected, because each one draws
+    /// in a lane of its own, which is what `height` has to make room for.
+    fn rail_count(&self) -> usize {
+        self.spans().iter().filter(|s| s.to.col != s.from.col + 1).count()
+    }
+
+    /// Every drawn edge as the polyline the canvas paints, in `spans` order.
+    ///
+    /// A span gives an edge two node boxes and nothing else, and drawing box to
+    /// box is what made a fan read as one thick line: three judges into one
+    /// synthesizer all left the same point on the left and all arrived at the
+    /// same point on the right. Here each edge gets a port of its own on the
+    /// side it uses, and a node's ports are fanned in the order of the nodes the
+    /// fan reaches, so the lines of a fan come out parallel and never cross.
+    ///
+    /// An edge the columns cannot express as a step — a loop back to an earlier
+    /// stage, or a step that skips one — cannot be a straight line between
+    /// neighbouring columns either, or it would cut through the nodes in
+    /// between. Those take a lane of the rail below the band.
+    pub(crate) fn routes(&self) -> Vec<Route> {
+        let spans = self.spans();
+        let port = |ports: &[f32], at: usize| ports.get(at).copied().unwrap_or(0.5);
+
+        // Which side of a node each edge leaves and enters by, with the y (or x,
+        // for the rail) of the other end as its sort key.
+        let mut right: Vec<(usize, f32)> = Vec::new();
+        let mut left: Vec<(usize, f32)> = Vec::new();
+        let mut under_out: Vec<(usize, f32)> = Vec::new();
+        let mut under_in: Vec<(usize, f32)> = Vec::new();
+        let mut lanes: Vec<(usize, f32)> = Vec::new();
+        for (i, span) in spans.iter().enumerate() {
+            if span.to.col == span.from.col + 1 {
+                right.push((i, self.pos(&span.to).1));
+                left.push((i, self.pos(&span.from).1));
+            } else {
+                lanes.push((i, self.pos(&span.from).0.min(self.pos(&span.to).0)));
+                if span.to.col > span.from.col {
+                    right.push((i, self.pos(&span.to).1));
+                    left.push((i, self.pos(&span.from).1));
+                } else {
+                    under_out.push((i, self.pos(&span.to).0));
+                    under_in.push((i, self.pos(&span.from).0));
+                }
+            }
+        }
+        let right = spread(right, spans.len());
+        let left = spread(left, spans.len());
+        let under_out = spread(under_out, spans.len());
+        let under_in = spread(under_in, spans.len());
+        // One lane per detouring edge, in the order the edges start, so the lanes
+        // stack the way the columns run and never move between renders.
+        lanes.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let lane_of: HashMap<usize, usize> =
+            lanes.iter().enumerate().map(|(lane, (edge, _))| (*edge, lane)).collect();
+
+        spans
+            .into_iter()
             .enumerate()
-            .flat_map(|(i, col)| col.iter().map(move |n| (n.id.as_str(), i)))
-            .collect();
-        self.edges.iter().any(|e| match (col_of.get(e.from.as_str()), col_of.get(e.to.as_str())) {
-            (Some(&from), Some(&to)) => to <= from && e.from != e.to,
-            _ => false,
-        })
+            .map(|(i, span)| {
+                let (ax, ay) = self.pos(&span.from);
+                let (bx, by) = self.pos(&span.to);
+                let back = span.to.col <= span.from.col;
+                let lane = |lane: usize| self.band() + RAIL_TOP_GAP + lane as f32 * RAIL_LANE_GAP;
+                let points = if span.to.col == span.from.col + 1 {
+                    let (y1, y2) = (ay + NH * port(&right, i), by + NH * port(&left, i));
+                    vec![(ax + NW, y1), (bx, y2)]
+                } else if back {
+                    let (x1, x2) = (ax + NW * port(&under_out, i), bx + NW * port(&under_in, i));
+                    let y = lane(lane_of.get(&i).copied().unwrap_or(0));
+                    vec![(x1, ay + NH), (x1, y), (x2, y), (x2, by + NH)]
+                } else {
+                    // Over the rail and back up: it skips a stage, so it may not
+                    // cross the stages in between.
+                    let (y1, y2) = (ay + NH * port(&right, i), by + NH * port(&left, i));
+                    let y = lane(lane_of.get(&i).copied().unwrap_or(0));
+                    vec![
+                        (ax + NW, y1),
+                        (ax + NW + DETOUR, y1),
+                        (ax + NW + DETOUR, y),
+                        (bx - DETOUR, y),
+                        (bx - DETOUR, y2),
+                        (bx, y2),
+                    ]
+                };
+                Route { span, points, back }
+            })
+            .collect()
     }
 
     fn pos(&self, n: &Node) -> (f32, f32) {
@@ -295,6 +405,59 @@ pub(crate) fn fit_zoom(width: f32, model: &Model, gutter: f32) -> f32 {
         return 1.;
     }
     ((width - gutter) / w).clamp(0.4, 1.)
+}
+
+/// Where along a node's side each of the edges that use that side meets it, as
+/// a fraction of the side, indexed by the edge. The fan is spread evenly, one
+/// port per edge, in the order of the nodes it reaches — a node with one edge
+/// out of it keeps that edge at its middle, and a node with three gets thirds.
+/// Before this, every edge used the middle, which is why a fan drew as one line.
+fn spread(ports: Vec<(usize, f32)>, count: usize) -> Vec<f32> {
+    let mut ports = ports;
+    ports.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    let total = ports.len() as f32;
+    let mut spread = vec![0.5; count];
+    for (rank, (edge, _)) in ports.iter().enumerate() {
+        if let Some(slot) = spread.get_mut(*edge) {
+            *slot = (rank + 1) as f32 / (total + 1.);
+        }
+    }
+    spread
+}
+
+/// The edge under a point of the model, if the point is on one and not on a
+/// node. The canvas paints the nodes over the edges that run beneath them, so a
+/// point inside a node box belongs to the node, whichever edge passes under it.
+fn route_at(routes: &[Route], model: &Model, x: f32, y: f32, slop: f32) -> Option<(String, String)> {
+    let on_node = model.flat().into_iter().any(|node| {
+        let (nx, ny) = model.pos(node);
+        x >= nx && x <= nx + NW && y >= ny && y <= ny + NH
+    });
+    if on_node {
+        return None;
+    }
+    routes.iter().find_map(|route| {
+        let near = route.points.windows(2).any(|segment| match segment {
+            [from, to] => distance_to_segment((x, y), *from, *to) <= slop,
+            _ => false,
+        });
+        near.then(|| (route.span.from.id.clone(), route.span.to.id.clone()))
+    })
+}
+
+/// How far a point lies from a segment, in the same units: the distance to the
+/// nearest point of the segment, which is the distance to its line once the
+/// projection has been clamped to its two ends.
+fn distance_to_segment((x, y): (f32, f32), (x1, y1): (f32, f32), (x2, y2): (f32, f32)) -> f32 {
+    let (dx, dy) = (x2 - x1, y2 - y1);
+    let length_squared = dx * dx + dy * dy;
+    let along = if length_squared > f32::EPSILON {
+        (((x - x1) * dx + (y - y1) * dy) / length_squared).clamp(0., 1.)
+    } else {
+        0.
+    };
+    let (near_x, near_y) = (x1 + along * dx, y1 + along * dy);
+    ((x - near_x).powi(2) + (y - near_y).powi(2)).sqrt()
 }
 
 #[derive(Clone, Copy)]
@@ -343,6 +506,10 @@ pub struct MiniOrkGraph {
     /// Where a canvas drag started (mouse, scroll offset), while panning.
     drag: std::rc::Rc<std::cell::Cell<Option<(Point<Pixels>, Point<Pixels>)>>>,
     selected: Option<String>,
+    /// The edge the user picked on the canvas, by its two node ids. The canvas
+    /// draws its endpoints and fades everything else until the pick is cleared,
+    /// which a click on the background does (see `render_canvas`).
+    selected_edge: Option<(String, String)>,
     tab: String,
     /// Detail per (node, tab), so switching back is instant.
     detail: HashMap<(String, String), Value>,
@@ -432,6 +599,7 @@ impl MiniOrkGraph {
             canvas_scroll: ScrollHandle::new(),
             drag: Default::default(),
             selected: None,
+            selected_edge: None,
             tab: "overview".into(),
             detail: HashMap::new(),
             detail_error: None,
@@ -493,6 +661,10 @@ impl MiniOrkGraph {
             self.expanded.clear();
         }
         self.selected = Some(node);
+        // A node and an edge are not both in focus: the node's own edges go blue
+        // under its inspector, and leaving a picked edge standing would fade the
+        // very graph the click asked to look at.
+        self.selected_edge = None;
         self.load_detail(cx);
         cx.notify();
     }
@@ -869,8 +1041,20 @@ impl MiniOrkGraph {
     /// zoom, selection and pan state.
     fn render_graph(&self, cx: &mut Context<Self>) -> AnyElement {
         let this = cx.entity().downgrade();
-        let on_node = std::rc::Rc::new(move |node: &str, _: &mut Window, cx: &mut App| {
-            this.update(cx, |this, cx| this.select(node.to_string(), cx)).ok();
+        let on_node = std::rc::Rc::new({
+            let this = this.clone();
+            move |node: &str, _: &mut Window, cx: &mut App| {
+                this.update(cx, |this, cx| this.select(node.to_string(), cx)).ok();
+            }
+        });
+        let on_edge = std::rc::Rc::new(move |edge: Option<(String, String)>, _: &mut Window, cx: &mut App| {
+            this.update(cx, |this, cx| {
+                if this.selected_edge != edge {
+                    this.selected_edge = edge;
+                    cx.notify();
+                }
+            })
+            .ok();
         });
         render_canvas(
             &self.model,
@@ -879,19 +1063,25 @@ impl MiniOrkGraph {
             &self.query,
             &self.canvas_scroll,
             &self.drag,
+            self.selected_edge.clone(),
             on_node,
+            on_edge,
             cx,
         )
     }
 }
 
-/// The DAG canvas: dot grid, curved edges, column heads, nodes. Shared by the
+/// The DAG canvas: dot grid, straight edges, column heads, nodes. Shared by the
 /// run graph overlay, a node tab's strip and the run page's DAG section, so the
 /// three cannot drift into looking like three renderers of the same run.
 ///
-/// `on_node` is the one thing the hosts disagree on: the overlay and the node
-/// tab select the node into their inspector, and the run page opens the node's
-/// own tab.
+/// `selected_edge` is the edge the user picked, by its two node ids: its
+/// endpoints keep their weight and everything else fades behind it, until a
+/// click on the background clears it. `on_node` and `on_edge` are the two things
+/// the hosts disagree on: the overlay and the node tab select the node into
+/// their inspector and the run page opens the node's own tab, while the edge
+/// pick is the canvas' own state, held by whoever draws it and set through the
+/// callback.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_canvas(
     model: &Model,
@@ -900,7 +1090,9 @@ pub(crate) fn render_canvas(
     query: &str,
     scroll: &ScrollHandle,
     drag: &std::rc::Rc<std::cell::Cell<Option<(Point<Pixels>, Point<Pixels>)>>>,
+    selected_edge: Option<(String, String)>,
     on_node: std::rc::Rc<dyn Fn(&str, &mut Window, &mut App)>,
+    on_edge: std::rc::Rc<dyn Fn(Option<(String, String)>, &mut Window, &mut App)>,
     cx: &mut App,
 ) -> AnyElement {
     // The state this canvas reads is the renderer's, not the store's: owned
@@ -919,11 +1111,18 @@ pub(crate) fn render_canvas(
     let mono = p::mono_font(cx);
 
     // Edges: the recipe's own list when the engine sends one, else the legacy
-    // fan-out. The selected node's edges are blue, edges into pending nodes dim.
-    let edge_model = model.clone();
-    let edge_spans = model.spans();
+    // fan-out, each routed to a straight polyline with a port of its own at both
+    // ends (see `Model::routes`). The selected node's edges are blue, edges into
+    // pending nodes dim, and an edge the user picked is the only one at full
+    // strength.
+    let edge_routes = model.routes();
+    // The click handler hit-tests against the same routes the painter draws, so
+    // the clone is taken before the paint closure takes ownership of them.
+    let hit_routes = edge_routes.clone();
+    let hit_model = model.clone();
     let edge_query = query.to_string();
     let edge_selected = selected.clone();
+    let edge_picked = selected_edge.clone();
     let edges = canvas(
         |_, _, _| (),
         move |bounds: Bounds<Pixels>, _, window, _| {
@@ -936,64 +1135,58 @@ pub(crate) fn render_canvas(
                         .to_lowercase()
                         .contains(&edge_query)
             };
-            for span in &edge_spans {
-                let (a, b) = (&span.from, &span.to);
-                let (ax, ay) = edge_model.pos(a);
-                let (bx, by) = edge_model.pos(b);
-                // A back edge is one the columns cannot express: the layout put
-                // its target at or before its source, because it is a loop and
-                // not a step. It leaves the bottom of the source, dips under the
-                // band and comes back up into the bottom of the target, drawn
-                // broken so it never reads as a forward step.
-                let back = b.col <= a.col;
-                let (x1, y1, x2, y2, c1x, c1y, c2x, c2y) = if back {
-                    let (x1, y1) = (ax + NW / 2., ay + NH);
-                    let (x2, y2) = (bx + NW / 2., by + NH);
-                    let dip = y1.max(y2) + BACK_ARC_DIP;
-                    (x1, y1, x2, y2, x1, dip, x2, dip)
-                } else {
-                    let (x1, y1) = (ax + NW, ay + NH / 2.);
-                    let (x2, y2) = (bx, by + NH / 2.);
-                    (x1, y1, x2, y2, x1 + 36., y1, x2 - 36., y2)
-                };
-                let hot = edge_selected.as_deref().is_some_and(|s| s == a.id || s == b.id);
+            let scale = z.max(0.6);
+            for route in &edge_routes {
+                let (a, b) = (&route.span.from, &route.span.to);
+                let points = &route.points;
+                let Some(&(start_x, start_y)) = points.first() else { continue };
+                // The arrowhead follows the last straight run, so which way an
+                // edge goes is legible without tracing it back to its source.
+                let Some((end_x, end_y)) = points.last().copied() else { continue };
+                let Some((run_x, run_y)) = points.len().checked_sub(2).and_then(|i| points.get(i)).copied() else { continue };
+                let picked = edge_picked.as_ref().is_some_and(|(from, to)| from == &a.id && to == &b.id);
+                let faded = edge_picked.is_some() && !picked;
+                let hot = picked
+                    || (edge_picked.is_none()
+                        && edge_selected.as_deref().is_some_and(|s| s == a.id || s == b.id));
                 let mut colour = if hot {
                     c(p::BLUE)
                 } else if b.state.is_empty() || b.state == "pending" {
                     c(p::BORDER2)
-                } else if span.kind.is_empty() {
+                } else if route.span.kind.is_empty() {
                     c(p::DIM)
                 } else {
-                    crate::thumb::edge_colour(&span.kind)
+                    crate::thumb::edge_colour(&route.span.kind)
                 };
-                if !(matches(a) && matches(b)) {
+                if faded {
+                    colour = colour.opacity(0.12);
+                } else if !(matches(a) && matches(b)) {
                     colour = colour.opacity(0.25);
                 }
-                let scale = z.max(0.6);
-                let mut path = PathBuilder::stroke(px(if hot { 2. } else { 1.3 } * scale));
-                if back {
+                let width = if picked { 2.4 } else if hot { 2. } else { 1.3 };
+                let mut path = PathBuilder::stroke(px(width * scale));
+                if route.back {
                     path = path.dash_array(&[px(5. * scale), px(4. * scale)]);
                 }
-                path.move_to(at(x1, y1));
-                path.cubic_bezier_to(at(x2, y2), at(c1x, c1y), at(c2x, c2y));
+                path.move_to(at(start_x, start_y));
+                for (x, y) in &points[1..] {
+                    path.line_to(at(*x, *y));
+                }
                 if let Ok(path) = path.build() {
                     window.paint_path(path, colour);
                 }
-                // An arrowhead at the target: the one thing the old drawing
-                // could not show was which way an edge ran. Its direction is the
-                // curve's own end tangent, so it follows the arc round too.
-                let (dx, dy) = (x2 - c2x, y2 - c2y);
+                let (dx, dy) = (end_x - run_x, end_y - run_y);
                 let length = (dx * dx + dy * dy).sqrt();
                 if length > 0.001 {
                     let (ux, uy) = (dx / length, dy / length);
-                    let (px_, py_) = (-uy, ux);
-                    let (back_x, back_y) = (x2 - ux * 9., y2 - uy * 9.);
+                    let (nx, ny) = (-uy, ux);
+                    let (tail_x, tail_y) = (end_x - ux * 9., end_y - uy * 9.);
                     let mut head = PathBuilder::fill();
                     head.add_polygon(
                         &[
-                            at(x2, y2),
-                            at(back_x + px_ * 4.5, back_y + py_ * 4.5),
-                            at(back_x - px_ * 4.5, back_y - py_ * 4.5),
+                            at(end_x, end_y),
+                            at(tail_x + nx * 4.5, tail_y + ny * 4.5),
+                            at(tail_x - nx * 4.5, tail_y - ny * 4.5),
                         ],
                         true,
                     );
@@ -1024,8 +1217,14 @@ pub(crate) fn render_canvas(
     let nodes = model.flat().into_iter().cloned().collect::<Vec<_>>().into_iter().map(|n| {
         let (x, y) = model.pos(&n);
         let on = selected.as_deref() == Some(n.id.as_str());
+        // While an edge is picked its two endpoints are the only nodes at full
+        // strength, and they carry the pick's own colour — the edge and the two
+        // boxes it joins read as one thing.
+        let on_edge = selected_edge
+            .as_ref()
+            .is_some_and(|(from, to)| from == &n.id || to == &n.id);
         let (m, mc) = mark(&n.state);
-        let border = if on {
+        let border = if on || on_edge {
             c(p::BLUE)
         } else if n.state == "running" {
             p::ca(0x74ade88c)
@@ -1051,7 +1250,7 @@ pub(crate) fn render_canvas(
             .border(px(if on { 2. } else { 1. }))
             .border_color(border)
             .bg(c(if pending { 0x2a2e36 } else { 0x323843 }))
-            .when(!matches(&n), |this| this.opacity(0.28))
+            .when(!matches(&n) || (selected_edge.is_some() && !on_edge), |this| this.opacity(0.28))
             .cursor_pointer()
             .hover(|s| s.border_color(c(p::BLUE)))
             .child(
@@ -1143,7 +1342,38 @@ pub(crate) fn render_canvas(
                 })
                 .on_mouse_up(gpui::MouseButton::Left, {
                     let drag = drag.clone();
-                    move |_, _, _| drag.set(None)
+                    let scroll = scroll.clone();
+                    let on_edge = on_edge.clone();
+                    move |event: &gpui::MouseUpEvent, window: &mut Window, cx: &mut App| {
+                        // A drag that panned the canvas is not a click, and the
+                        // pick it lands on has to survive the pan.
+                        let panned = drag.get().is_some_and(|(start, _)| {
+                            let (dx, dy) = (
+                                f32::from(event.position.x - start.x),
+                                f32::from(event.position.y - start.y),
+                            );
+                            dx * dx + dy * dy > 9.
+                        });
+                        drag.set(None);
+                        if panned {
+                            return;
+                        }
+                        // Where the click landed in the model the canvas drew:
+                        // the scroll container's viewport, moved by its offset
+                        // and past the felt around the graph, in model units.
+                        let bounds = scroll.bounds();
+                        let offset = scroll.offset();
+                        let x = (f32::from(event.position.x - bounds.origin.x) + f32::from(offset.x)
+                            - CANVAS_PAD)
+                            / z;
+                        let y = (f32::from(event.position.y - bounds.origin.y) + f32::from(offset.y)
+                            - CANVAS_PAD)
+                            / z;
+                        // A click on the background picks nothing, which is what
+                        // clears a pick.
+                        let hit = route_at(&hit_routes, &hit_model, x, y, EDGE_HIT / z);
+                        (on_edge)(hit, window, cx);
+                    }
                 })
                 .on_mouse_move({
                     let drag = drag.clone();
@@ -1160,15 +1390,20 @@ pub(crate) fn render_canvas(
                     }
                 })
                 .child(
-                    div().flex_none().w(px(w + 56.)).h(px(h + 56.)).p(px(28.)).child(
-                        div()
-                            .relative()
-                            .w(px(w))
-                            .h(px(h))
-                            .child(edges)
-                            .children(heads)
-                            .children(nodes),
-                    ),
+                    div()
+                        .flex_none()
+                        .w(px(w + CANVAS_PAD * 2.))
+                        .h(px(h + CANVAS_PAD * 2.))
+                        .p(px(CANVAS_PAD))
+                        .child(
+                            div()
+                                .relative()
+                                .w(px(w))
+                                .h(px(h))
+                                .child(edges)
+                                .children(heads)
+                                .children(nodes),
+                        ),
                 ),
         )
         .into_any_element()
