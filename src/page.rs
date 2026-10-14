@@ -72,6 +72,7 @@ pub fn default_label(key: &str) -> &'static str {
         "nodes" => "Nodes",
         "setup" => "Setup & health",
         "features" => "Features",
+        "task" => "Task",
         _ => "mini-ork",
     }
 }
@@ -2065,6 +2066,16 @@ pub fn open_page(
         }
         return;
     }
+    // `task` is opened *per id* like `run`: its tab identity is `args["uid"]`,
+    // not the page key. Without this arm the generic path below would find the
+    // first task tab, activate it and merge the new uid into its args — a
+    // second epic would silently replace the first one's page.
+    if key == "task" {
+        if let Some(uid) = args.get("uid").cloned() {
+            open_task(workspace, uid, tab, window, cx);
+        }
+        return;
+    }
     workspace.update(cx, |workspace, cx| {
         let existing = workspace
             .items_of_type::<MiniOrkPage>(cx)
@@ -2085,6 +2096,41 @@ pub fn open_page(
         }
         let weak = cx.entity().downgrade();
         let page = cx.new(|cx| MiniOrkPage::new(key, tab, args, String::new(), weak, cx));
+        workspace.add_item_to_active_pane(Box::new(page), None, true, window, cx);
+    });
+}
+
+/// Open a task's tab (or bring it forward).
+///
+/// One tab per `uid` — an epic id, or a mirrored ticket's `provider:key`. The
+/// tab is titled by the page itself (`task.py` sets the payload's `label`), so
+/// `title` here only seeds the label until the first load lands.
+pub fn open_task(
+    workspace: &Entity<Workspace>,
+    uid: String,
+    tab: Option<String>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    workspace.update(cx, |workspace, cx| {
+        let existing = workspace
+            .items_of_type::<MiniOrkPage>(cx)
+            .find(|page| page.read(cx).key == "task" && page.read(cx).args.get("uid") == Some(&uid));
+        if let Some(existing) = existing {
+            workspace.activate_item(&existing, true, true, window, cx);
+            if tab.is_some() {
+                existing.update(cx, |page, cx| {
+                    page.tab = tab;
+                    page.begin_switch();
+                    page.reload(cx);
+                });
+            }
+            return;
+        }
+        let weak = cx.entity().downgrade();
+        let mut args = BTreeMap::new();
+        args.insert("uid".to_string(), uid);
+        let page = cx.new(|cx| MiniOrkPage::new("task".into(), tab, args, String::new(), weak, cx));
         workspace.add_item_to_active_pane(Box::new(page), None, true, window, cx);
     });
 }
