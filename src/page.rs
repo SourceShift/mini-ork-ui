@@ -582,6 +582,7 @@ impl MiniOrkPage {
     }
 
     fn render_header(&self, page: &Value, cx: &mut Context<Self>) -> AnyElement {
+        let run_id = self.args.get("run").cloned().unwrap_or_default();
         let title = str_of(page, "title");
         let sub = str_of(page, "sub");
         let desc = str_of(page, "desc");
@@ -612,7 +613,29 @@ impl MiniOrkPage {
                                     .font(mono.clone())
                                     .text_color(p::named(&str_of(chip, "c")))
                                     .child(str_of(chip, "t"))
-                            })),
+                            }))
+                            .when(!run_id.is_empty(), |this| {
+                                // Where this page is: the run id, in the same
+                                // mono the node tab's breadcrumb uses, with a
+                                // copy button beside it so the id is usable
+                                // rather than only readable. A node tab spells
+                                // out `run/node` here; a run page has no node.
+                                this.child(
+                                    h_flex()
+                                        .gap_1()
+                                        .items_center()
+                                        .child(
+                                            p::text(run_id.clone(), 11.5, p::MUTED)
+                                                .font(mono.clone())
+                                                .max_w(rems_from_px(200_f32))
+                                                .truncate(),
+                                        )
+                                        .child(
+                                            ui::CopyButton::new("run-copy", run_id.clone())
+                                                .tooltip_label("Copy run id"),
+                                        ),
+                                )
+                            }),
                     )
                     .when(!desc.is_empty(), |this| this.child(self.render_desc(&desc, cx)))
                     .when(!sub.is_empty(), |this| {
@@ -1503,6 +1526,43 @@ impl MiniOrkPage {
             .into_any_element()
     }
 
+    /// The run page's DAG strip: the run graph in `strip_only` mode — the
+    /// canvas alone — with the full-screen button the canvas has no chrome of
+    /// its own to carry. Mounted above the header so every tab of the run leads
+    /// with it, the same widget a node tab leads with.
+    fn render_strip(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(graph) = self.dag_graph.clone() else {
+            return div().into_any_element();
+        };
+        div()
+            .relative()
+            .flex_none()
+            .w_full()
+            .min_w_0()
+            .child(graph)
+            .child(
+                div()
+                    .id("run-strip-full")
+                    .absolute()
+                    .top(rems_from_px(8_f32))
+                    .left(rems_from_px(8_f32))
+                    .size(rems_from_px(26_f32))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(rems_from_px(6_f32))
+                    .border_1()
+                    .border_color(c(p::BORDER2))
+                    .bg(c(p::BG))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(c(p::HOVER)))
+                    .tooltip(ui::Tooltip::text("Full screen · inspect every node"))
+                    .child(Icon::new(IconName::MaximizeAlt).size(IconSize::Small).color(c(p::MUTED).into()))
+                    .on_click(cx.listener(|this, _, window, cx| this.open_graph(None, window, cx))),
+            )
+            .into_any_element()
+    }
+
     /// The Graph tab's `Steps · Flow map` toggle: which of the two run views
     /// leads. The choice is `show_flow_map` on the page, so it outlives a
     /// reload of the same run.
@@ -1770,6 +1830,9 @@ impl MiniOrkPage {
         let graph = cx.new(|cx| {
             let mut graph = crate::graph::MiniOrkGraph::new(model, focus, workspace, page_handle, window, cx);
             graph.tab_mode = true;
+            // The run page carries the strip and its own chrome below it, so
+            // the graph draws no inspector: a node opens in its own tab.
+            graph.strip_only = true;
             graph
         });
         // The pills row rides with the node Overview, and the graph's own
@@ -1933,17 +1996,10 @@ impl Render for MiniOrkPage {
                     page.update(cx, |page, cx| page.open_graph(node, window, cx)).ok();
                 });
             }
-            // The DAG tab leads with the run graph, so the page carries one
-            // rather than drawing a canvas of its own that cannot inspect a
-            // node. Deferred for the window it needs to build.
-            if self.dag_graph.is_none()
-                && !self.show_flow_map
-                && self
-                    .data
-                    .as_ref()
-                    .and_then(|data| data.as_ref().ok())
-                    .is_some_and(|page| matches!(str_of(page, "tab").as_str(), "dag" | "graph"))
-            {
+            // Every tab of a run page leads with the run graph, so the page
+            // carries one rather than drawing a canvas of its own that cannot
+            // inspect a node. Deferred for the window it needs to build.
+            if self.dag_graph.is_none() && !self.dock && !self.show_flow_map && self.args.contains_key("run") {
                 let page = cx.entity().downgrade();
                 window.defer(cx, move |window, cx| {
                     page.update(cx, |page, cx| page.ensure_dag_graph(window, cx)).ok();
@@ -1995,10 +2051,21 @@ impl Render for MiniOrkPage {
                     .flatten()
                     .filter(|flow| flow.is_object())
                     .map(|flow| crate::flow::render_flow_part_a(self, flow, &self.flow_scroll, window, cx));
-                let hide_dag = show_flow;
+                // The run's DAG leads the page, over the header and the engine's
+                // own tabs, so it is the strip a node tab leads with and the
+                // detail below is readable without opening a second tab. It is
+                // built a frame late (it needs a window), so on the first frame
+                // the section's stand-in canvas draws instead and `hide_dag`
+                // stays false — the strip takes over on the next.
+                let strip_live = !self.dock && self.args.contains_key("run") && self.dag_graph.is_some() && !show_flow;
+                let strip = strip_live.then(|| self.render_strip(cx));
+                // Retire the section once the strip owns the canvas, so the DAG
+                // is drawn once rather than twice.
+                let hide_dag = show_flow || strip_live;
                 let toggle = on_graph.then(|| self.render_graph_toggle(cx));
                 v_flex()
                     .gap_3p5()
+                    .children(strip)
                     .when(!self.dock, |this| this.child(self.render_header(&page, cx)))
                     .child(v_flex().children(self.render_tabs(&page, cx)).children(bar.map(|b| div().mt(rems_from_px(-2_f32)).child(b))))
                     .children(toggle)

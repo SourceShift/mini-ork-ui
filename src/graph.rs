@@ -534,6 +534,12 @@ pub struct MiniOrkGraph {
     /// Hosted in a node tab: the run's DAG on top (the node selected), the
     /// node's own inspector below, full width.
     pub tab_mode: bool,
+    /// A run page's strip: the same DAG canvas a node tab leads with, but with
+    /// no inspector under it. The page owns the chrome below — breadcrumb,
+    /// tabs, sections — so a strip click opens the node's own tab instead of
+    /// filling an in-place panel. This is what keeps a run page and a node tab
+    /// one strip and one tab bar rather than two of each.
+    pub strip_only: bool,
     /// The node tab's DAG strip has fit its zoom to the strip's width once
     /// (re-armed by `set_model`), so the whole graph — including the
     /// rightmost node — is visible without scrolling.
@@ -616,6 +622,7 @@ impl MiniOrkGraph {
             severity: "info",
             texts: Texts::default(),
             tab_mode: false,
+            strip_only: false,
             tab_fit: false,
             stream_full: false,
             _load: Task::ready(()),
@@ -1043,7 +1050,19 @@ impl MiniOrkGraph {
         let this = cx.entity().downgrade();
         let on_node = std::rc::Rc::new({
             let this = this.clone();
-            move |node: &str, _: &mut Window, cx: &mut App| {
+            let page = self.page.clone();
+            let strip_only = self.strip_only;
+            move |node: &str, window: &mut Window, cx: &mut App| {
+                // A run page's strip carries no inspector, so a click has to
+                // land somewhere: it opens the node's own tab, the same detail
+                // the page's own canvas and a Threads card give. A node tab
+                // keeps its in-place inspector, and selects there instead.
+                if strip_only {
+                    if let Some(page) = page.upgrade() {
+                        page.update(cx, |page, cx| page.open_node_tab(node.to_string(), window, cx));
+                    }
+                    return;
+                }
                 this.update(cx, |this, cx| this.select(node.to_string(), cx)).ok();
             }
         });
@@ -2697,6 +2716,22 @@ impl Render for MiniOrkGraph {
                     .border_color(c(p::BORDER))
                     .child(if self.list_view { self.render_list(cx) } else { self.render_graph(cx) })
             });
+            // The run page's strip is the canvas alone: the page draws the
+            // breadcrumb, tabs and sections under it, so nothing here may take
+            // the rest of the pane. `stream_full` and `stream_takes_the_tab`
+            // are both unreachable here — their only toggles live in the
+            // inspector's tab strip, which this mode does not build — so `dag`
+            // is always present.
+            if self.strip_only {
+                self.texts.end();
+                return v_flex()
+                    .id("mini-ork-dag-strip")
+                    .flex_none()
+                    .w_full()
+                    .min_w_0()
+                    .children(dag)
+                    .into_any_element();
+            }
             let inspector = selected.map(|node| self.render_inspector(&node, window, cx));
             self.texts.end();
             return v_flex()
