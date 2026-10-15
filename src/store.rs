@@ -117,8 +117,9 @@ pub fn init(cx: &mut App) {
 
 /// The design's layout once the window has loaded: the agent panel in the left
 /// dock, the rail in the right one. `MINI_ORK_IDE_OPEN` (comma-separated
-/// `key[:tab]`, `run:<id>[:tab][:graph[:node]]` or `run:latest…`) also opens pages —
-/// for checking the IDE without clicking through it.
+/// `key[:tab][?k=v&…]`, `run:<id>[:tab][:graph[:node]]` or `run:latest…`) also
+/// opens pages — for checking the IDE without clicking through it. The query
+/// carries the page's args, so `thread?thread=<id>` opens one thread.
 fn startup_layout(window: &mut Window, cx: &mut Context<Workspace>) {
     cx.spawn_in(window, async move |workspace, cx| {
         // The first board read takes longer than loading the panels.
@@ -163,6 +164,7 @@ fn startup_layout(window: &mut Window, cx: &mut Context<Workspace>) {
                 let entity = cx.entity();
                 window.defer(cx, move |window, cx| {
                     for entry in spec.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+                        let (entry, args) = open_entry_args(entry);
                         let parts: Vec<&str> = entry.split(':').collect();
                         if parts[0] == "run" && parts.len() >= 2 {
                             let tab = parts.get(2).map(|t| t.to_string());
@@ -187,7 +189,7 @@ fn startup_layout(window: &mut Window, cx: &mut Context<Workspace>) {
                             }
                         } else {
                             let tab = parts.get(1).map(|t| t.to_string());
-                            crate::page::open_page(&entity, parts[0].to_string(), tab, BTreeMap::new(), window, cx);
+                            crate::page::open_page(&entity, parts[0].to_string(), tab, args, window, cx);
                         }
                     }
                 });
@@ -195,6 +197,19 @@ fn startup_layout(window: &mut Window, cx: &mut Context<Workspace>) {
             .ok();
     })
     .detach();
+}
+
+/// One `MINI_ORK_IDE_OPEN` entry split into its `key[:tab]` part and the page
+/// args its `?k=v&…` query carries. A pair without `=` is ignored.
+fn open_entry_args(entry: &str) -> (&str, BTreeMap<String, String>) {
+    let (head, query) = entry.split_once('?').unwrap_or((entry, ""));
+    let args = query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .filter(|(key, _)| !key.is_empty())
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+    (head, args)
 }
 
 impl BoardStore {
@@ -660,4 +675,23 @@ pub fn run_cli(args: Vec<String>, with_home: bool, workspace: &Entity<Workspace>
         });
     })
     .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_open_entry_carries_its_page_args() {
+        let (head, args) = open_entry_args("thread?thread=smoke-1&x=2");
+        assert_eq!(head, "thread");
+        assert_eq!(args.get("thread").map(String::as_str), Some("smoke-1"));
+        assert_eq!(args.get("x").map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn an_entry_without_a_query_or_with_a_bare_key_has_no_args() {
+        assert_eq!(open_entry_args("kanban:tasks"), ("kanban:tasks", BTreeMap::new()));
+        assert_eq!(open_entry_args("kanban?flag&=v"), ("kanban", BTreeMap::new()));
+    }
 }
