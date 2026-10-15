@@ -178,14 +178,24 @@ pub async fn resolve_home(root: &Path) -> Option<PathBuf> {
 }
 
 async fn run_json(bin: &Path, args: &[String], home: &Path) -> Result<Value> {
-    let output = util::command::new_command(bin)
+    let mut command = util::command::new_command(bin);
+    command
         .args(args)
         .arg("--home")
         .arg(home)
+        // Engine code that reads `MINI_ORK_HOME` rather than `--home` (the
+        // ContextNest caches) otherwise falls back to `.mini-ork` under the
+        // IDE's own working directory, which can be inside the app bundle —
+        // and a file there breaks the bundle's code signature.
+        .env("MINI_ORK_HOME", home)
         // An inherited flag would stop the launcher from switching to
         // mini-ork's own Python.
         .env_remove("MINI_ORK_VENV_ACTIVE")
-        .env("MINI_ORK_IDE_SPEC", "2")
+        .env("MINI_ORK_IDE_SPEC", "2");
+    if let Some(project) = home.parent() {
+        command.current_dir(project).env("PWD", project);
+    }
+    let output = command
         .output()
         .await
         .with_context(|| format!("running {}", bin.display()))?;
@@ -379,5 +389,34 @@ pub async fn run_action(bin: PathBuf, home: PathBuf, args: Vec<String>, with_hom
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(anyhow!("{}", last(&stderr).max(last(&stdout))))
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn page_reads_give_the_engine_its_home_and_project() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("mini-ork-run-json-{}", std::process::id()));
+        let project = root.join("project");
+        let home = project.join(".mini-ork");
+        std::fs::create_dir_all(&home)?;
+        let bin = root.join("fake-mini-ork");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\nprintf '{\"home\":\"%s\",\"cwd\":\"%s\"}' \"$MINI_ORK_HOME\" \"$(pwd -P)\"\n",
+        )?;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))?;
+
+        let value = futures::executor::block_on(run_json(&bin, &["board".into()], &home));
+        let expected_cwd = std::fs::canonicalize(&project)?;
+        std::fs::remove_dir_all(&root)?;
+        let value = value?;
+
+        assert_eq!(value["home"].as_str(), home.to_str());
+        assert_eq!(value["cwd"].as_str(), expected_cwd.to_str());
+        Ok(())
     }
 }
