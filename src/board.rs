@@ -19,6 +19,12 @@ pub struct Board {
     pub header: Header,
     #[serde(default)]
     pub runs: Vec<Run>,
+    /// How many runs exist, against the page in `runs` — the only thing that
+    /// can answer "is there another page", which :mod:`crate::sidebar` needs
+    /// for its Load more control. `None` from an engine that predates the
+    /// field, which leaves that control to its own defaults.
+    #[serde(default)]
+    pub total: Option<u64>,
     #[serde(default)]
     pub counts: Counts,
 }

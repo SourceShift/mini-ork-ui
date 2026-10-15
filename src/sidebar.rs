@@ -370,6 +370,24 @@ impl MiniOrkSidebar {
         }
     }
 
+    /// The board's own read is the panel's census: it knows how many runs
+    /// exist, so it — not the page — is what says whether the runs have ended.
+    ///
+    /// Derived on every read rather than latched to the last page's answer.
+    /// The store re-reads while a run is live, and a panel that had already
+    /// loaded the final page would otherwise grow a fresh button on the next
+    /// poll. A live search owns the flag instead: its page counts its own
+    /// matches, which the board's unfiltered census cannot speak for.
+    fn sync_has_more(&mut self, board: Option<&Board>) {
+        if self.results.is_some() {
+            return;
+        }
+        let Some(total) = board.and_then(|board| board.total) else {
+            return;
+        };
+        self.has_more = (self.visible_runs(board).len() as u64) < total;
+    }
+
     fn store_generation(&self, cx: &App) -> u64 {
         self.workspace(cx)
             .and_then(|workspace| BoardStore::for_workspace(&workspace, cx))
@@ -1749,6 +1767,7 @@ impl Render for MiniOrkSidebar {
         // Render is the trigger the store's notify reaches: the board re-reads
         // on a filesystem change, so the DAGs follow it at the same cadence.
         self.ensure_thumbs(board.as_ref(), cx);
+        self.sync_has_more(board.as_ref());
         let active_key = workspace.as_ref().and_then(|w| Self::active_page_key(w, cx));
         let needs_you = board.as_ref().map_or(0, |b| b.counts.needs_you);
         let strip = self.render_strip(board.as_ref(), workspace.clone(), window, cx);
