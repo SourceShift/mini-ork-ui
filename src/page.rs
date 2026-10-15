@@ -853,6 +853,10 @@ impl MiniOrkPage {
             "table" => return self.render_table(index, s, cx),
             "kv" => return self.render_kv(index, s, cx),
             "list" => return self.render_list(index, s, cx),
+            // A sheet preview reads like every other table.
+            "document" if str_of(s, "kind") == "grid" => {
+                return self.render_table(index, &crate::documents::grid_table(s), cx);
+            }
             _ => {}
         }
         let title = str_of(s, "title");
@@ -860,6 +864,9 @@ impl MiniOrkPage {
         let mut actions = arr(s, "actions");
         if kind == "markdown" && !str_of(s, "path").is_empty() {
             actions.push(serde_json::json!({ "label": "Open", "kind": "ghost", "do": { "path": str_of(s, "path") } }));
+        }
+        if kind == "document" {
+            actions.extend(crate::documents::open_action(s));
         }
         let body = match kind.as_str() {
             "bars" => self.render_bars(s, cx),
@@ -873,6 +880,7 @@ impl MiniOrkPage {
             "findings" => self.render_findings(index, s, cx),
             "checks" => self.render_checks(index, s, cx),
             "agents" => self.render_agents(index, s, cx),
+            "document" => self.render_document_body(index, s, cx),
             // Full document, capped in height and scrolled inside.
             "markdown" => self
                 .texts

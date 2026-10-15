@@ -20,6 +20,7 @@
 
 mod board;
 mod components;
+mod documents;
 mod flow;
 mod graph;
 mod ide_http;

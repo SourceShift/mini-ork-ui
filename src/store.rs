@@ -536,6 +536,8 @@ pub fn perform(
         crate::projects::switch_to(workspace, PathBuf::from(root), window, cx);
     } else if action.get("project_pick").and_then(Value::as_bool) == Some(true) {
         crate::projects::add(workspace, window, cx);
+    } else if let Some(pick) = action.get("pick_files") {
+        pick_files(pick, workspace, origin, window, cx);
     } else if let Some(root) = action.get("project_forget").and_then(Value::as_str) {
         // Forget edits the registry and nothing else, so the window does not
         // move: the page listing the projects redraws itself instead.
@@ -585,6 +587,49 @@ pub fn new_thread(workspace: &Entity<Workspace>, text: &str, window: &mut Window
 }
 
 /// Run `mini-ork <args>`; report the outcome as a toast and refresh.
+/// `{"pick_files": {"cli": [...], "prompt": p, "home": b}}`: ask for files with the
+/// native picker, then run the `cli` with the chosen absolute paths appended
+/// (e.g. `threads attach <id> <paths…>`). A cancelled picker runs nothing.
+fn pick_files(pick: &Value, workspace: &Entity<Workspace>, origin: Origin, window: &mut Window, cx: &mut App) {
+    let args: Vec<String> = pick
+        .get("cli")
+        .and_then(Value::as_array)
+        .map(|args| args.iter().filter_map(|a| a.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    if args.is_empty() {
+        return;
+    }
+    let with_home = pick.get("home").and_then(Value::as_bool).unwrap_or(true);
+    let prompt = pick
+        .get("prompt")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(|text| SharedString::from(text.to_string()));
+    let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+        files: true,
+        directories: false,
+        multiple: true,
+        prompt,
+    });
+    let workspace = workspace.downgrade();
+    window
+        .spawn(cx, async move |cx| {
+            let Ok(Ok(Some(paths))) = paths.await else { return };
+            if paths.is_empty() {
+                return;
+            }
+            let mut argv = args;
+            argv.extend(paths.iter().map(|path| path.to_string_lossy().into_owned()));
+            cx.update(|_, cx| {
+                if let Some(workspace) = workspace.upgrade() {
+                    run_cli(argv, with_home, &workspace, origin, cx);
+                }
+            })
+            .log_err();
+        })
+        .detach();
+}
+
 pub fn run_cli(args: Vec<String>, with_home: bool, workspace: &Entity<Workspace>, origin: Origin, cx: &mut App) {
     let Some(store) = BoardStore::for_workspace(workspace, cx) else {
         return;
