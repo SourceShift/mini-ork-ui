@@ -1,12 +1,12 @@
 //! The mini-ork IDE design's palette, sizes and small building blocks.
 //!
 //! Views name design colours (`BG`, `TEXT`, `GREEN`, …); `c` / `ca` return
-//! them. Orca's neutral dark values are the default. Setting
-//! `MINI_ORK_PALETTE=theme` opts out and maps every key onto the ACTIVE Zed
-//! theme (editor/panel backgrounds, borders, text levels, status and syntax
-//! colours), so the IDE follows any theme, light or dark, and re-colours when
-//! the theme changes. Pages name colours rather than sending hex — see
-//! `mini_ork/ide_pages/spec.py`.
+//! them as the ACTIVE Zed theme draws them — editor/panel backgrounds,
+//! borders, text levels, status and syntax colours — so the IDE follows any
+//! theme, light or dark, and re-colours when the theme changes. Setting
+//! `MINI_ORK_PALETTE=orca` instead pins Orca's neutral dark values, for a
+//! window that should not follow the reader's theme. Pages name colours rather
+//! than sending hex — see `mini_ork/ide_pages/spec.py`.
 
 use std::{collections::HashMap, sync::RwLock};
 
@@ -70,9 +70,9 @@ pub const RADIUS_BTN: f32 = 6.;
 static THEMED: RwLock<Option<HashMap<u32, Hsla>>> = RwLock::new(None);
 
 /// Rebuild the design → theme map from the active theme. Called at init and
-/// whenever the theme changes. The Orca dark look is the default; setting
-/// `MINI_ORK_PALETTE=theme` keeps the older behaviour of mapping every design
-/// key onto the active Zed theme (an opt-out for users who don't want Orca).
+/// whenever the theme changes. Every key maps onto the active Zed theme by
+/// default; `MINI_ORK_PALETTE=orca` swaps in Orca's neutral dark values, for a
+/// window that should not follow the reader's theme.
 pub fn sync_theme(cx: &App) {
     let theme = cx.theme();
     let colors = theme.colors();
@@ -86,7 +86,11 @@ pub fn sync_theme(cx: &App) {
     };
     // A surface a little darker than `base`, in light and dark themes alike.
     let shade = |base: Hsla, amount: f32| Hsla { l: (base.l - amount).clamp(0., 1.), ..base };
-    let orca = std::env::var("MINI_ORK_PALETTE").as_deref() != Ok("theme");
+    // The theme map is the default: a pane that ignores the reader's theme
+    // reads as another application bolted into the window. `=orca` is the
+    // opt-in, and any other value — including the older `=theme`, which the
+    // default already gives — is ignored rather than treated as truthy.
+    let orca = std::env::var("MINI_ORK_PALETTE").as_deref() == Ok("orca");
     let map = if orca {
         HashMap::from([
             (BG, rgb(0x0a0a0a).into()),
