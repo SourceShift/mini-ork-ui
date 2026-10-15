@@ -1090,11 +1090,13 @@ impl MiniOrkPage {
     }
 
     fn render_list(&self, index: usize, s: &Value, cx: &mut Context<Self>) -> AnyElement {
+        let mono = p::mono_font(cx);
         let items = arr(s, "items");
         let body = v_flex()
             .gap_2()
             .children(items.iter().enumerate().map(|(i, item)| {
                 let sub = str_of(item, "sub");
+                let when = str_of(item, "when");
                 let acts = arr(item, "acts");
                 let title = self.texts.text(
                     format!("s{index}-i{i}"),
@@ -1124,6 +1126,19 @@ impl MiniOrkPage {
                                 this.child(self.texts.text(format!("s{index}-is{i}"), &sub, Look::new(11., c(p::SUB)), cx))
                             }),
                     )
+                    .when(!when.is_empty(), |this| {
+                        // The row's clock time, right-aligned in mono so the
+                        // stamps form one column down the panel.
+                        this.child(
+                            div()
+                                .flex_none()
+                                .mt(px(2.))
+                                .font(mono.clone())
+                                .text_size(rems_from_px(11_f32))
+                                .text_color(c(p::SUB))
+                                .child(when),
+                        )
+                    })
                     .when(!acts.is_empty(), |this| {
                         // The row's actions are all ghost buttons: the Orca
                         // list keeps its weight in the title, not the chrome.
