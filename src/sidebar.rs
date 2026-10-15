@@ -267,6 +267,10 @@ impl MiniOrkSidebar {
         if query.is_empty() {
             self.results = None;
             self._search = Task::ready(());
+            // The in-flight page just lost its task, so nothing else will clear
+            // the flag: an emptied search box would otherwise leave the control
+            // spinning for the rest of the session.
+            self.loading_more = false;
             cx.notify();
             return;
         }
@@ -322,7 +326,8 @@ impl MiniOrkSidebar {
         self._search = cx.spawn(async move |this, cx| {
             let page = cx.background_spawn(board::fetch_runs(bin, home, query.clone(), offset, 50)).await;
             this.update(cx, |this, cx| {
-                this.loading_more = false;
+                // A newer query owns the panel now, and its own read clears the
+                // flag; this page belongs to the list it was fetched for.
                 if this.query != query {
                     return;
                 }
@@ -340,6 +345,11 @@ impl MiniOrkSidebar {
                         log::warn!("mini-ork runs page: {error}");
                     }
                 }
+                // Cleared here, with the runs already installed and the notify
+                // still to come: the spinner is what says the list is still
+                // growing, so the frame that drops it must be the frame that
+                // shows what it was waiting for.
+                this.loading_more = false;
                 cx.notify();
             })
             .ok();
@@ -963,9 +973,13 @@ impl MiniOrkSidebar {
         for run in shown {
             list = list.child(self.render_run(run, &run.state, now, workspace, cx));
         }
-        if self.loading_more {
-            list = list.child(p::text("Loading…", 11.5, p::SUB).px_2().py_1p5());
-        } else if self.has_more && !runs.is_empty() {
+        // The control every further page of runs comes from, and it stays where
+        // the runs end. A load swaps its label for a spinner rather than
+        // replacing the control: a button that disappears under the pointer
+        // cannot be told from one that was never there, and the reader loses
+        // the row they were about to click twice on.
+        if self.has_more && (!runs.is_empty() || self.loading_more) {
+            let loading = self.loading_more;
             list = list.child(
                 div()
                     .id("board-load-more")
@@ -976,11 +990,30 @@ impl MiniOrkSidebar {
                     .border_color(c(p::BORDER2))
                     .text_center()
                     .text_size(rems_from_px(11.5_f32))
-                    .text_color(c(p::MUTED))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(c(p::HOVER)).text_color(c(p::TEXT)))
-                    .child("Load more")
-                    .on_click(cx.listener(|this, _, _, cx| this.load_more(cx))),
+                    .text_color(c(if loading { p::SUB } else { p::MUTED }))
+                    .when(loading, |s| s.cursor_default())
+                    .when(!loading, |s| {
+                        s.cursor_pointer()
+                            .hover(|s| s.bg(c(p::HOVER)).text_color(c(p::TEXT)))
+                            .on_click(cx.listener(|this, _, _, cx| this.load_more(cx)))
+                    })
+                    .child(if loading {
+                        div()
+                            .flex()
+                            .justify_center()
+                            .child(
+                                Icon::new(IconName::LoadCircle)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Custom(c(p::SUB)))
+                                    .with_throttled_rotate(
+                                        SharedString::from("board-load-more-spin"),
+                                        2,
+                                    ),
+                            )
+                            .into_any_element()
+                    } else {
+                        "Load more".into_any_element()
+                    }),
             );
         }
         // Zed's own threads come after the engine's runs: the board's tiles and
