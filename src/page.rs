@@ -398,6 +398,34 @@ impl MiniOrkPage {
         self.reload(cx);
     }
 
+    /// The page's main tab: the first one it declares, so the run's own top
+    /// rather than a sub-view of it. Read off the payload rather than named
+    /// here, because the engine is what orders the tabs — v2 leads with Story
+    /// and v1 with DAG, and neither should be hard-coded into the chrome.
+    pub(crate) fn main_tab(&self) -> String {
+        self.data
+            .as_ref()
+            .and_then(|data| data.as_ref().ok())
+            .and_then(|data| data.get("tabs"))
+            .and_then(Value::as_array)
+            .and_then(|tabs| tabs.first())
+            .and_then(|tab| tab.get("key"))
+            .and_then(Value::as_str)
+            .filter(|key| !key.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| "story".into())
+    }
+
+    /// Go to the page's main tab. A no-op on a page already there, so a click on
+    /// the DAG's background costs nothing when it is the DAG that is leading.
+    pub(crate) fn goto_main_tab(&mut self, cx: &mut Context<Self>) {
+        let tab = self.main_tab();
+        if self.tab.as_deref() == Some(tab.as_str()) {
+            return;
+        }
+        self.set_tab(tab, cx);
+    }
+
     /// Whether a fresh fetch is worth starting now: not mid-fetch, and not
     /// within two seconds of the last one. Board bumps can arrive in bursts
     /// during a live run, and each reload cancels the fetch in flight.
@@ -1481,6 +1509,13 @@ impl MiniOrkPage {
                             .ok();
                     },
                 );
+                // This canvas is drawn *by* the run page, so the empty
+                // background is the page's own top: the same destination the
+                // run graph's strip goes to.
+                let empty_page = cx.entity().downgrade();
+                let on_empty = std::rc::Rc::new(move |_: &mut Window, cx: &mut App| {
+                    empty_page.update(cx, |this, cx| this.goto_main_tab(cx)).ok();
+                });
                 // ⌘/ctrl + wheel and a pinch zoom about the pointer, anchored
                 // against `dag_scroll` — this canvas belongs to the page, so the
                 // page holds its zoom, the way it holds its pan and its pick.
@@ -1558,6 +1593,7 @@ impl MiniOrkPage {
                         self.dag_edge.clone(),
                         on_node,
                         on_edge,
+                        on_empty,
                         on_zoom,
                         cx,
                     ))

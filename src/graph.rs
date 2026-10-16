@@ -563,15 +563,21 @@ fn spread(ports: Vec<(usize, f32)>, count: usize) -> Vec<f32> {
     spread
 }
 
-/// The edge under a point of the model, if the point is on one and not on a
-/// node. The canvas paints the nodes over the edges that run beneath them, so a
-/// point inside a node box belongs to the node, whichever edge passes under it.
-fn route_at(routes: &[Route], model: &Model, x: f32, y: f32, slop: f32) -> Option<(String, String)> {
-    let on_node = model.flat().into_iter().any(|node| {
+/// Whether a point of the model falls inside a node's box. The canvas paints the
+/// nodes over the edges that run beneath them, so a point on a node belongs to
+/// the node: the edge hit test must not pick an edge crossing under it, and the
+/// background click must not fire on it.
+fn hits_node(model: &Model, x: f32, y: f32) -> bool {
+    model.flat().into_iter().any(|node| {
         let (nx, ny) = model.pos(node);
         x >= nx && x <= nx + NW && y >= ny && y <= ny + NH
-    });
-    if on_node {
+    })
+}
+
+/// The edge under a point of the model, if the point is on one and not on a
+/// node (see `hits_node`).
+fn route_at(routes: &[Route], model: &Model, x: f32, y: f32, slop: f32) -> Option<(String, String)> {
+    if hits_node(model, x, y) {
         return None;
     }
     routes.iter().find_map(|route| {
@@ -1334,6 +1340,40 @@ impl MiniOrkGraph {
                 this.update(cx, |this, cx| this.select(node.to_string(), cx)).ok();
             }
         });
+        // An empty patch of the canvas is the way out of the graph, and where it
+        // leads is the third thing the hosts disagree on. A run page's strip and
+        // its DAG tab are drawn *by* the run page, so the background is the run's
+        // own main tab. A node tab leads with this strip and has no other way
+        // back, so it opens the run's page. The full-screen graph sits over the
+        // run page, so dismissing it is what shows it.
+        let on_empty = std::rc::Rc::new({
+            let this = this.clone();
+            let page = self.page.clone();
+            let workspace = self.workspace.clone();
+            let run = self.model.run_id.clone();
+            let title = self.model.title.clone();
+            let (strip_only, tab_mode) = (self.strip_only, self.tab_mode);
+            move |window: &mut Window, cx: &mut App| {
+                if strip_only {
+                    if let Some(page) = page.upgrade() {
+                        page.update(cx, |page, cx| page.goto_main_tab(cx));
+                    }
+                    return;
+                }
+                if tab_mode {
+                    let Some(workspace) = workspace.upgrade() else {
+                        return;
+                    };
+                    // The page knows which tab is its own; a node tab opened
+                    // without it (from a Threads card) leaves the engine to
+                    // resolve the run's default.
+                    let tab = page.upgrade().map(|page| page.read(cx).main_tab());
+                    crate::page::open_run(&workspace, run.clone(), title.clone(), tab, window, cx);
+                    return;
+                }
+                this.update(cx, |_, cx| cx.emit(DismissEvent)).ok();
+            }
+        });
         let on_edge = std::rc::Rc::new({
             let this = this.clone();
             move |edge: Option<(String, String)>, _: &mut Window, cx: &mut App| {
@@ -1359,6 +1399,7 @@ impl MiniOrkGraph {
             self.selected_edge.clone(),
             on_node,
             on_edge,
+            on_empty,
             on_zoom,
             cx,
         )
@@ -1375,7 +1416,9 @@ impl MiniOrkGraph {
 /// the hosts disagree on: the overlay and the node tab select the node into
 /// their inspector and the run page opens the node's own tab, while the edge
 /// pick is the canvas' own state, held by whoever draws it and set through the
-/// callback.
+/// callback. `on_empty` is the third: a click on the canvas where there is no
+/// node and no edge, which each host answers with wherever the run's page is for
+/// it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_canvas(
     model: &Model,
@@ -1387,6 +1430,7 @@ pub(crate) fn render_canvas(
     selected_edge: Option<(String, String)>,
     on_node: std::rc::Rc<dyn Fn(&str, &mut Window, &mut App)>,
     on_edge: std::rc::Rc<dyn Fn(Option<(String, String)>, &mut Window, &mut App)>,
+    on_empty: std::rc::Rc<dyn Fn(&mut Window, &mut App)>,
     // A zoom gesture landed on the canvas: how much, and where. The host owns
     // the zoom and the scroll handle, so the canvas only reports.
     on_zoom: std::rc::Rc<dyn Fn(f32, Point<Pixels>, &mut Window, &mut App)>,
@@ -1641,6 +1685,7 @@ pub(crate) fn render_canvas(
                     let drag = drag.clone();
                     let scroll = scroll.clone();
                     let on_edge = on_edge.clone();
+                    let on_empty = on_empty.clone();
                     move |event: &gpui::MouseUpEvent, window: &mut Window, cx: &mut App| {
                         // A drag that panned the canvas is not a click, and the
                         // pick it lands on has to survive the pan.
@@ -1667,9 +1712,20 @@ pub(crate) fn render_canvas(
                             - CANVAS_PAD)
                             / z;
                         // A click on the background picks nothing, which is what
-                        // clears a pick.
+                        // clears a pick; it is also the empty canvas the host
+                        // navigates away from.
                         let hit = route_at(&hit_routes, &hit_model, x, y, EDGE_HIT / z);
-                        (on_edge)(hit, window, cx);
+                        if hit.is_some() {
+                            (on_edge)(hit, window, cx);
+                            return;
+                        }
+                        // A node owns its own box — it carries a click handler
+                        // of its own, which this one must not shadow.
+                        if hits_node(&hit_model, x, y) {
+                            return;
+                        }
+                        (on_edge)(None, window, cx);
+                        (on_empty)(window, cx);
                     }
                 })
                 .on_mouse_move({
