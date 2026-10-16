@@ -24,8 +24,8 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, Bounds, ClickEvent, Context, Div, Font, FontWeight, Hsla, PathBuilder, Pixels,
-    Point, ScrollHandle, SharedString, Window, canvas, point, px,
+    AnyElement, Bounds, ClickEvent, Context, Div, Font, FontWeight, Hsla, PathBuilder, PinchEvent,
+    Pixels, Point, ScrollHandle, ScrollWheelEvent, SharedString, Window, canvas, point, px,
 };
 use serde_json::Value;
 use ui::{ScrollAxes, Scrollbars, WithScrollbar as _, prelude::*};
@@ -99,6 +99,10 @@ const LEGEND_H: f32 = 3.;
 const CHIP_D: f32 = 20.;
 /// How wide a stage chip's jump glow is.
 const STAGE_HIGHLIGHT_W: f32 = 150.;
+
+/// The margin `Fit` leaves inside the scroller's own box, so the fitted map
+/// does not sit flush against the card's edge.
+const FLOW_FIT_GUTTER: f32 = 28.;
 
 /// The map, parsed out of the page's `flow` object. Every part is optional:
 /// the builder is fail-soft, so a run with no build (or no verifiers) simply
@@ -829,6 +833,13 @@ pub(crate) fn render_flow_part_a(
     window: &mut Window,
     cx: &mut Context<MiniOrkPage>,
 ) -> AnyElement {
+    // The map is drawn by multiplying its own model coordinates, because this
+    // gpui fork has no element transform. Every geometry site below goes
+    // through `zp` — one conversion point — so the map scales as a drawing
+    // rather than by rewriting `Layout`, which stays in model units and is
+    // also read by `connectors`.
+    let k = crate::graph::clamp_zoom(page.flow_zoom);
+    let zp = move |value: f32| px(value * k);
     let mut map = Flow::parse(flow);
     // "Live" is read off the page's own states, before any replay override: a
     // run that is still running reloads on its own and needs no replay.
@@ -854,10 +865,10 @@ pub(crate) fn render_flow_part_a(
             pieces.push(
                 div()
                     .absolute()
-                    .left(px(anchor - STAGE_HIGHLIGHT_W / 2.))
-                    .top(px(0.))
-                    .w(px(STAGE_HIGHLIGHT_W))
-                    .h(px(layout.height))
+                    .left(zp(anchor - STAGE_HIGHLIGHT_W / 2.))
+                    .top(zp(0.))
+                    .w(zp(STAGE_HIGHLIGHT_W))
+                    .h(zp(layout.height))
                     .bg(ca(0x74ade833))
                     .into_any_element(),
             );
@@ -866,33 +877,33 @@ pub(crate) fn render_flow_part_a(
 
     // The connectors go in first: GPUI paints children in insertion order, so
     // every marker and label below lands on top of the strokes.
-    pieces.push(paint_strokes(strokes));
+    pieces.push(paint_strokes(strokes, k));
 
     // Ticket in: a thick bar, with the run's id under its title.
     pieces.push(
         div()
             .absolute()
-            .left(px(layout.ticket_x))
-            .top(px(TRACK_Y - TICKET_H / 2.))
-            .w(px(TICKET_W))
-            .h(px(TICKET_H))
+            .left(zp(layout.ticket_x))
+            .top(zp(TRACK_Y - TICKET_H / 2.))
+            .w(zp(TICKET_W))
+            .h(zp(TICKET_H))
             .bg(c(p::TEXT))
             .into_any_element(),
     );
     pieces.push(
         div()
             .absolute()
-            .left(px(layout.ticket_label_x))
-            .top(px(TRACK_Y - 20.))
-            .w(px(TICKET_LABEL_W))
+            .left(zp(layout.ticket_label_x))
+            .top(zp(TRACK_Y - 20.))
+            .w(zp(TICKET_LABEL_W))
             .child(
                 div()
-                    .text_size(px(13.))
+                    .text_size(zp(13.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(c(p::TEXT))
                     .child("Ticket in"),
             )
-            .child(p::text_px(map.ticket_id.clone(), 11., p::SUB).truncate())
+            .child(p::text_px(map.ticket_id.clone(), 11. * k, p::SUB).truncate())
             .into_any_element(),
     );
 
@@ -904,11 +915,11 @@ pub(crate) fn render_flow_part_a(
             pieces.push(
                 div()
                     .absolute()
-                    .left(px(centre_x - 60.))
-                    .top(px(TRACK_Y - 34.))
-                    .w(px(120.))
+                    .left(zp(centre_x - 60.))
+                    .top(zp(TRACK_Y - 34.))
+                    .w(zp(120.))
                     .text_center()
-                    .text_size(px(12.))
+                    .text_size(zp(12.))
                     .font(mono.clone())
                     .text_color(c(p::GREEN))
                     .child(step.score.clone())
@@ -918,9 +929,9 @@ pub(crate) fn render_flow_part_a(
         let mut hit = div()
             .id(("flow-step", index))
             .absolute()
-            .left(px(centre_x - 15.))
-            .top(px(TRACK_Y - 15.))
-            .size(px(30.))
+            .left(zp(centre_x - 15.))
+            .top(zp(TRACK_Y - 15.))
+            .size(zp(30.))
             .flex()
             .items_center()
             .justify_center();
@@ -933,11 +944,11 @@ pub(crate) fn render_flow_part_a(
         pieces.push(
             div()
                 .absolute()
-                .left(px(centre_x - 62.))
-                .top(px(TRACK_Y + 16.))
-                .w(px(124.))
+                .left(zp(centre_x - 62.))
+                .top(zp(TRACK_Y + 16.))
+                .w(zp(124.))
                 .text_center()
-                .text_size(px(13.))
+                .text_size(zp(13.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(c(label_colour))
                 .child(step.label.clone())
@@ -947,11 +958,11 @@ pub(crate) fn render_flow_part_a(
             pieces.push(
                 div()
                     .absolute()
-                    .left(px(centre_x - 62.))
-                    .top(px(TRACK_Y + 33.))
-                    .w(px(124.))
+                    .left(zp(centre_x - 62.))
+                    .top(zp(TRACK_Y + 33.))
+                    .w(zp(124.))
                     .text_center()
-                    .text_size(px(11.))
+                    .text_size(zp(11.))
                     .text_color(c(p::SUB))
                     .child(step.sub.clone())
                     .into_any_element(),
@@ -966,10 +977,10 @@ pub(crate) fn render_flow_part_a(
         pieces.push(
             div()
                 .absolute()
-                .left(px(spot.left))
-                .top(px(spot.top))
-                .w(px(PKG_W))
-                .h(px(height))
+                .left(zp(spot.left))
+                .top(zp(spot.top))
+                .w(zp(PKG_W))
+                .h(zp(height))
                 .bg(ca(0x363c4766))
                 .into_any_element(),
         );
@@ -978,11 +989,11 @@ pub(crate) fn render_flow_part_a(
             pieces.push(
                 div()
                     .absolute()
-                    .left(px(spot.left + PKG_W - 88.))
-                    .top(px(spot.top + 6.))
-                    .w(px(80.))
+                    .left(zp(spot.left + PKG_W - 88.))
+                    .top(zp(spot.top + 6.))
+                    .w(zp(80.))
                     .text_right()
-                    .text_size(px(10.))
+                    .text_size(zp(10.))
                     .font(mono.clone())
                     .text_color(c(p::SUB))
                     .child(package.label.clone())
@@ -996,9 +1007,9 @@ pub(crate) fn render_flow_part_a(
             pieces.push(
                 div()
                     .absolute()
-                    .left(px(spot.left + 16.))
-                    .top(px(lane_y - 20.))
-                    .text_size(px(10.5))
+                    .left(zp(spot.left + 16.))
+                    .top(zp(lane_y - 20.))
+                    .text_size(zp(10.5))
                     .text_color(c(p::SUB))
                     .child(lane.role.clone())
                     .into_any_element(),
@@ -1006,11 +1017,11 @@ pub(crate) fn render_flow_part_a(
             pieces.push(
                 div()
                     .absolute()
-                    .left(px(spot.left + 14.))
-                    .top(px(lane_y - 1.))
-                    .w(px(PKG_W - 28.))
-                    .h(px(2.))
-                    .rounded(px(1.))
+                    .left(zp(spot.left + 14.))
+                    .top(zp(lane_y - 1.))
+                    .w(zp(PKG_W - 28.))
+                    .h(zp(2.))
+                    .rounded(zp(1.))
                     .bg(c(colour))
                     .into_any_element(),
             );
@@ -1028,11 +1039,11 @@ pub(crate) fn render_flow_part_a(
         pieces.push(
             div()
                 .absolute()
-                .left(px(apex_x - 60.))
-                .top(px(TRACK_Y - ARC_APEX_DY - 14.))
-                .w(px(120.))
+                .left(zp(apex_x - 60.))
+                .top(zp(TRACK_Y - ARC_APEX_DY - 14.))
+                .w(zp(120.))
                 .text_center()
-                .text_size(px(11.))
+                .text_size(zp(11.))
                 .text_color(c(p::SUB))
                 .child("revise")
                 .into_any_element(),
@@ -1041,19 +1052,19 @@ pub(crate) fn render_flow_part_a(
             pieces.push(
                 div()
                     .absolute()
-                    .left(px(apex_x - 62.))
-                    .top(px(TRACK_Y - ARC_APEX_DY - 36.))
-                    .w(px(124.))
+                    .left(zp(apex_x - 62.))
+                    .top(zp(TRACK_Y - ARC_APEX_DY - 36.))
+                    .w(zp(124.))
                     .flex()
                     .justify_center()
                     .child(
                         div()
                             .id(("flow-approved", index))
-                            .px(px(8.))
-                            .py(px(2.))
+                            .px(zp(8.))
+                            .py(zp(2.))
                             .border_1()
                             .border_color(c(p::ORANGE))
-                            .text_size(px(10.5))
+                            .text_size(zp(10.5))
                             .text_color(c(p::ORANGE))
                             .child(format!("approved in round {round}")),
                     )
@@ -1070,12 +1081,12 @@ pub(crate) fn render_flow_part_a(
         pieces.push(
             div()
                 .absolute()
-                .left(px(layout.integrate_x - 20.))
-                .top(px(TRACK_Y - PILL_H / 2. - 40.))
-                .w(px(PILL_W + 40.))
-                .line_height(px(18.))
+                .left(zp(layout.integrate_x - 20.))
+                .top(zp(TRACK_Y - PILL_H / 2. - 40.))
+                .w(zp(PILL_W + 40.))
+                .line_height(zp(18.))
                 .text_center()
-                .text_size(px(14.))
+                .text_size(zp(14.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(c(p::TEXT))
                 .child(step.label.clone())
@@ -1084,12 +1095,12 @@ pub(crate) fn render_flow_part_a(
         pieces.push(
             div()
                 .absolute()
-                .left(px(layout.integrate_x - 20.))
-                .top(px(TRACK_Y - PILL_H / 2. - 20.))
-                .w(px(PILL_W + 40.))
-                .line_height(px(14.))
+                .left(zp(layout.integrate_x - 20.))
+                .top(zp(TRACK_Y - PILL_H / 2. - 20.))
+                .w(zp(PILL_W + 40.))
+                .line_height(zp(14.))
                 .text_center()
-                .text_size(px(11.))
+                .text_size(zp(11.))
                 .text_color(c(p::SUB))
                 .child(step.sub.clone())
                 .into_any_element(),
@@ -1097,10 +1108,10 @@ pub(crate) fn render_flow_part_a(
         pieces.push(
             div()
                 .absolute()
-                .left(px(layout.integrate_x))
-                .top(px(TRACK_Y - PILL_H / 2.))
-                .w(px(PILL_W))
-                .h(px(PILL_H))
+                .left(zp(layout.integrate_x))
+                .top(zp(TRACK_Y - PILL_H / 2.))
+                .w(zp(PILL_W))
+                .h(zp(PILL_H))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -1118,23 +1129,23 @@ pub(crate) fn render_flow_part_a(
         pieces.push(
             h_flex()
                 .absolute()
-                .left(px(layout.integrate_x))
-                .top(px(TRACK_Y + 26. + 18. * index as f32))
-                .gap(px(6.))
+                .left(zp(layout.integrate_x))
+                .top(zp(TRACK_Y + 26. + 18. * index as f32))
+                .gap(zp(6.))
                 .items_center()
                 .child(
                     div()
-                        .w(px(84.))
-                        .text_size(px(12.))
+                        .w(zp(84.))
+                        .text_size(zp(12.))
                         .text_color(c(p::BODY))
                         .truncate()
                         .child(tier.label.clone()),
                 )
                 .child(
-                    div().w(px(80.)).h(px(4.)).bg(c(p::BORDER2)).child(
+                    div().w(zp(80.)).h(zp(4.)).bg(c(p::BORDER2)).child(
                         div()
-                            .w(px(80. * filled))
-                            .h(px(4.))
+                            .w(zp(80. * filled))
+                            .h(zp(4.))
                             .bg(c(colour)),
                     ),
                 )
@@ -1153,9 +1164,9 @@ pub(crate) fn render_flow_part_a(
                 let mut circle = v_flex()
                     .id("flow-review-hub")
                     .absolute()
-                    .left(px(hub_x - HUB_R))
-                    .top(px(hub_y - HUB_R))
-                    .size(px(HUB_R * 2.))
+                    .left(zp(hub_x - HUB_R))
+                    .top(zp(hub_y - HUB_R))
+                    .size(zp(HUB_R * 2.))
                     .items_center()
                     .justify_center()
                     .rounded_full()
@@ -1164,7 +1175,7 @@ pub(crate) fn render_flow_part_a(
                     .border_color(c(p::TEXT))
                     .child(
                         div()
-                            .text_size(px(16.))
+                            .text_size(zp(16.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(c(p::TEXT))
                             .child("Review"),
@@ -1172,14 +1183,14 @@ pub(crate) fn render_flow_part_a(
                     .when(!review.verdict.is_empty(), |this| {
                         this.child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(zp(11.))
                                 .text_color(c(colour))
                                 .child(review.verdict.clone()),
                         )
                     })
                     .when(!review.score.is_empty(), |this| {
                         this.child(
-                            div().text_size(px(11.)).text_color(c(p::SUB)).child(review.score.clone()),
+                            div().text_size(zp(11.)).text_color(c(p::SUB)).child(review.score.clone()),
                         )
                     });
                 if let Some(handler) = page.action_handler(Some(&hub.action), cx) {
@@ -1217,9 +1228,9 @@ pub(crate) fn render_flow_part_a(
                 pieces.push(
                     div()
                         .absolute()
-                        .left(px(ring_x - SPOKE_RING / 2.))
-                        .top(px(ring_y - SPOKE_RING / 2.))
-                        .size(px(SPOKE_RING))
+                        .left(zp(ring_x - SPOKE_RING / 2.))
+                        .top(zp(ring_y - SPOKE_RING / 2.))
+                        .size(zp(SPOKE_RING))
                         .rounded_full()
                         .bg(c(p::CARD))
                         .border_2()
@@ -1229,11 +1240,11 @@ pub(crate) fn render_flow_part_a(
                 pieces.push(
                     div()
                         .absolute()
-                        .left(px(label_left))
-                        .top(px(ring_y - 9.))
-                        .w(px(SPOKE_LABEL_W))
+                        .left(zp(label_left))
+                        .top(zp(ring_y - 9.))
+                        .w(zp(SPOKE_LABEL_W))
                         .text_right()
-                        .text_size(px(13.))
+                        .text_size(zp(13.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(c(p::ORANGE))
                         .child("Fix")
@@ -1242,11 +1253,11 @@ pub(crate) fn render_flow_part_a(
                 pieces.push(
                     div()
                         .absolute()
-                        .left(px(label_left))
-                        .top(px(ring_y + 8.))
-                        .w(px(SPOKE_LABEL_W))
+                        .left(zp(label_left))
+                        .top(zp(ring_y + 8.))
+                        .w(zp(SPOKE_LABEL_W))
                         .text_right()
-                        .text_size(px(11.))
+                        .text_size(zp(11.))
                         .text_color(c(p::SUB))
                         .child(format!(
                             "then review again · {} {}",
@@ -1266,7 +1277,9 @@ pub(crate) fn render_flow_part_a(
     }
 
     // The card's own "Full screen" control: with the column DAG retired the
-    // flow map is the only in-page way in, so it has to carry the button.
+    // flow map is the only in-page way in, so it has to carry the button. It
+    // enlarges the *flow map* — it used to open the step graph, a different
+    // picture from the one the label names.
     pieces.push(
         div()
             .id("flow-full")
@@ -1284,14 +1297,22 @@ pub(crate) fn render_flow_part_a(
             .text_color(c(p::MUTED))
             .cursor_pointer()
             .hover(|style| style.bg(c(p::HOVER)).text_color(c(p::TEXT)))
-            .tooltip(ui::Tooltip::text("Full screen · inspect every node"))
-            .child("⤢ Full screen")
+            .tooltip(ui::Tooltip::text(if page.flow_full {
+                "Back to the page"
+            } else {
+                "Full screen · inspect every node"
+            }))
+            .child(if page.flow_full { "✕ Close" } else { "⤢ Full screen" })
             .on_click(cx.listener(
                 |page: &mut MiniOrkPage,
                  _: &ClickEvent,
-                 window: &mut Window,
+                 _: &mut Window,
                  cx: &mut Context<MiniOrkPage>| {
-                    page.open_graph(None, window, cx);
+                    if page.flow_full {
+                        page.close_flow_full(cx);
+                    } else {
+                        page.open_flow_full(cx);
+                    }
                 },
             ))
             .into_any_element(),
@@ -1325,9 +1346,9 @@ pub(crate) fn render_flow_part_a(
     if !map.stages.is_empty() {
         let mut row = h_flex()
             .absolute()
-            .left(px(layout.ticket_x))
-            .top(px(layout.height - CHIP_D - 12.))
-            .gap(px(12.))
+            .left(zp(layout.ticket_x))
+            .top(zp(layout.height - CHIP_D - 12.))
+            .gap(zp(12.))
             .items_center();
         for (index, stage) in map.stages.iter().enumerate() {
             let anchor = layout.stage_x.get(index).copied().unwrap_or(layout.hub_x);
@@ -1345,15 +1366,15 @@ pub(crate) fn render_flow_part_a(
                 h_flex()
                     .id(("flow-chip", index))
                     .cursor_pointer()
-                    .px(px(8.))
-                    .py(px(3.))
-                    .gap(px(7.))
+                    .px(zp(8.))
+                    .py(zp(3.))
+                    .gap(zp(7.))
                     .items_center()
                     .border_1()
                     .border_color(c(if focused { p::BLUE } else { p::BORDER2 }))
                     .child(
                         div()
-                            .size(px(CHIP_D))
+                            .size(zp(CHIP_D))
                             .flex_none()
                             .flex()
                             .items_center()
@@ -1362,13 +1383,13 @@ pub(crate) fn render_flow_part_a(
                             .border_2()
                             .border_color(c(ring_colour))
                             .when(filled, |this| this.bg(c(p::GREEN)))
-                            .text_size(px(11.))
+                            .text_size(zp(11.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(c(if filled { p::CARD } else { ring_colour }))
                             .child(format!("{}", stage.n)),
                     )
                     .child(
-                        div().text_size(px(13.)).text_color(c(p::TEXT)).child(stage.label.clone()),
+                        div().text_size(zp(13.)).text_color(c(p::TEXT)).child(stage.label.clone()),
                     )
                     .on_click(cx.listener(
                         move |page: &mut MiniOrkPage,
@@ -1378,7 +1399,7 @@ pub(crate) fn render_flow_part_a(
                             // Scroll offsets are negative: x runs from 0 (left
                             // edge) down to -max_offset (fully scrolled).
                             let max = jump_scroll.max_offset().x;
-                            let want = px((anchor - 120.).max(0.)).min(max);
+                            let want = zp((anchor - 120.).max(0.)).min(max);
                             jump_scroll.set_offset(point(-want, jump_scroll.offset().y));
                             let next = page.flow_focus.as_ref().map(|(_, seq)| *seq).unwrap_or(0) + 1;
                             page.flow_focus = Some((key.clone(), next));
@@ -1400,7 +1421,7 @@ pub(crate) fn render_flow_part_a(
         }
         row = row.child(
             div()
-                .text_size(px(11.))
+                .text_size(zp(11.))
                 .font(mono.clone())
                 .text_color(c(p::SUB))
                 .child("Click a stage to jump to it"),
@@ -1410,8 +1431,38 @@ pub(crate) fn render_flow_part_a(
 
     let surface = div()
         .relative()
-        .w(px(layout.width))
-        .h(px(layout.height))
+        .w(px(layout.width * k))
+        .h(px(layout.height * k))
+        // A gesture, not a `−`/`+` click, is how a map this wide is read. The
+        // listener sits on the scroller's *content* so it runs in the bubble
+        // phase before the scroller's own wheel handler: a modified wheel is
+        // swallowed here, and a bare one falls through to the pan.
+        .on_scroll_wheel(cx.listener(
+            |page: &mut MiniOrkPage,
+             event: &ScrollWheelEvent,
+             window: &mut Window,
+             cx: &mut Context<MiniOrkPage>| {
+                if !(event.modifiers.secondary() || event.modifiers.control) {
+                    return;
+                }
+                let delta = event.delta.pixel_delta(window.line_height());
+                let before = page.flow_zoom;
+                let after = crate::graph::step_zoom(before, -f32::from(delta.y) * crate::graph::ZOOM_WHEEL);
+                page.zoom_flow_from(after, event.position, before, cx);
+                cx.stop_propagation();
+            },
+        ))
+        .on_pinch(cx.listener(
+            |page: &mut MiniOrkPage,
+             event: &PinchEvent,
+             _: &mut Window,
+             cx: &mut Context<MiniOrkPage>| {
+                let before = page.flow_zoom;
+                let after = crate::graph::step_zoom(before, event.delta);
+                page.zoom_flow_from(after, event.position, before, cx);
+                cx.stop_propagation();
+            },
+        ))
         .children(pieces);
     let scroller = div()
         .id("flow-scroll")
@@ -1419,6 +1470,48 @@ pub(crate) fn render_flow_part_a(
         .overflow_x_scroll()
         .track_scroll(scroll)
         .child(surface);
+    // The cluster is the scroller's *sibling*, so it is neither scrolled with
+    // the map nor scaled by the zoom: it is chrome and stays put.
+    let controls = div()
+        .absolute()
+        .top(rems_from_px(4_f32))
+        .right(rems_from_px(4_f32))
+        .p(rems_from_px(2_f32))
+        .rounded(rems_from_px(7_f32))
+        .bg(c(p::CHROME))
+        .border_1()
+        .border_color(c(p::BORDER2))
+        .child(crate::graph::zoom_controls(
+            "flow",
+            page.flow_zoom,
+            false,
+            false,
+            cx.listener(|page: &mut MiniOrkPage, _: &ClickEvent, _: &mut Window, cx: &mut Context<MiniOrkPage>| {
+                page.flow_zoom =
+                    crate::graph::step_zoom(page.flow_zoom, -crate::graph::zoom_limits().step);
+                cx.notify();
+            }),
+            cx.listener(|page: &mut MiniOrkPage, _: &ClickEvent, _: &mut Window, cx: &mut Context<MiniOrkPage>| {
+                page.flow_zoom =
+                    crate::graph::step_zoom(page.flow_zoom, crate::graph::zoom_limits().step);
+                cx.notify();
+            }),
+            // Fit needs the map's own size, which only this renderer knows, so
+            // the arithmetic happens here rather than as a method on the page.
+            cx.listener(move |page: &mut MiniOrkPage, _: &ClickEvent, _: &mut Window, cx: &mut Context<MiniOrkPage>| {
+                let box_size = page.flow_scroll.bounds().size;
+                page.flow_zoom = crate::graph::box_fit_zoom(
+                    f32::from(box_size.width),
+                    f32::from(box_size.height),
+                    layout.width,
+                    layout.height,
+                    FLOW_FIT_GUTTER,
+                );
+                cx.notify();
+            }),
+            cx.listener(|_page: &mut MiniOrkPage, _: &ClickEvent, _: &mut Window, _cx: &mut Context<MiniOrkPage>| {}),
+            cx,
+        ));
     v_flex()
         .w_full()
         .min_w_0()
@@ -1427,7 +1520,7 @@ pub(crate) fn render_flow_part_a(
         .border_color(c(p::BORDER))
         .bg(c(p::CHROME))
         .child(
-            div().relative().w_full().child(scroller).custom_scrollbars(
+            div().relative().w_full().child(scroller).child(controls).custom_scrollbars(
                 Scrollbars::always_visible(ScrollAxes::Horizontal).tracked_scroll_handle(scroll),
                 window,
                 cx,
@@ -1818,14 +1911,19 @@ fn rollback_marker(rollback: &Rollback, layout: &Layout) -> AnyElement {
 
 /// Every connector, in one canvas. The chart is small and fully known at
 /// paint time, so there is no hit-testing or model state to keep.
-fn paint_strokes(strokes: Vec<Stroke>) -> AnyElement {
+fn paint_strokes(strokes: Vec<Stroke>, k: f32) -> AnyElement {
     canvas(
         |_, _, _| (),
         move |bounds: Bounds<Pixels>, _, window, _| {
             let origin = bounds.origin;
-            let at = |x: f32, y: f32| -> Point<Pixels> { point(origin.x + px(x), origin.y + px(y)) };
+            // The map's own coordinates become pixels here and nowhere else,
+            // so this one pair of multiplies scales every track, fan, arc and
+            // bezier at once — `Stroke` and `connectors` stay in model units.
+            let at = |x: f32, y: f32| -> Point<Pixels> {
+                point(origin.x + px(x * k), origin.y + px(y * k))
+            };
             for stroke in &strokes {
-                let mut path = PathBuilder::stroke(px(stroke.width));
+                let mut path = PathBuilder::stroke(px(stroke.width * k));
                 path.move_to(at(stroke.from.0, stroke.from.1));
                 match stroke.ctrl {
                     Some((ctrl1, ctrl2)) => path.cubic_bezier_to(

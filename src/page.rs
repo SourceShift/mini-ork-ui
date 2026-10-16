@@ -9,8 +9,8 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, Render,
-    SharedString, Task, WeakEntity, Window, px,
+    AnyElement, App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyDownEvent,
+    Pixels, Point, Render, SharedString, Task, WeakEntity, Window, px,
 };
 use serde_json::Value;
 use gpui::{
@@ -167,8 +167,20 @@ pub struct MiniOrkPage {
     /// `dag_drag` lives here: the page renders the canvas, so the pick it sets
     /// has to be kept by the page. `None` is the plain drawing.
     dag_edge: Option<(String, String)>,
+    /// The DAG canvas' zoom, when the reader has set one. `None` — the default
+    /// — is the fit that follows the box the canvas got, recomputed each frame
+    /// because the page, not a `MiniOrkGraph`, owns this canvas. Anything a
+    /// button or the wheel sets is kept, and `Fit` clears it back to `None`.
+    dag_zoom: Option<f32>,
     /// The run flow map scrolls sideways over its own track.
-    flow_scroll: ScrollHandle,
+    pub(crate) flow_scroll: ScrollHandle,
+    /// The flow map's zoom. Unlike the DAG canvas' `dag_zoom` there is no fit to
+    /// follow: 1.0 is the map drawn at its own size, and `Fit` moves it.
+    pub(crate) flow_zoom: f32,
+    /// The flow map, enlarged to the window. The map carries its own "Full
+    /// screen" control, so this is what that control sets — it used to open the
+    /// step graph, a different picture from the one the label names.
+    pub(crate) flow_full: bool,
     /// The Graph tab's Steps · Flow map toggle: true draws the flow map and
     /// hides the step graph (DAG). Default false = Steps. It lives on the
     /// page, so it survives reloads of the same run.
@@ -243,7 +255,10 @@ impl MiniOrkPage {
             dag_scroll: ScrollHandle::new(),
             dag_drag: Default::default(),
             dag_edge: None,
+            dag_zoom: None,
             flow_scroll: ScrollHandle::new(),
+            flow_zoom: 1.,
+            flow_full: false,
             show_flow_map: false,
             flow_focus: None,
             replay: Replay::default(),
@@ -1440,7 +1455,11 @@ impl MiniOrkPage {
                 // bounds yet; fitting to 1:1 covers it and the next frame
                 // corrects.
                 let measured = f32::from(self.dag_scroll.bounds().size.width);
-                let zoom = crate::graph::fit_zoom(measured, &model, 0.);
+                // The reader's own zoom when they have set one, else the fit —
+                // which is what keeps a reload from throwing their zoom away.
+                let zoom = self
+                    .dag_zoom
+                    .unwrap_or_else(|| crate::graph::fit_zoom(measured, &model, 0.));
                 let page = cx.entity().downgrade();
                 // Clicking a node here opens the node's own tab, the same
                 // detail a click in the run graph's DAG opens. The page handle
@@ -1462,6 +1481,67 @@ impl MiniOrkPage {
                             .ok();
                     },
                 );
+                // ⌘/ctrl + wheel and a pinch zoom about the pointer, anchored
+                // against `dag_scroll` — this canvas belongs to the page, so the
+                // page holds its zoom, the way it holds its pan and its pick.
+                let zoom_page = cx.entity().downgrade();
+                let on_zoom = std::rc::Rc::new(
+                    move |delta: f32, pointer: gpui::Point<gpui::Pixels>, _: &mut Window, cx: &mut App| {
+                        zoom_page
+                            .update(cx, |this, cx| {
+                                let next = crate::graph::step_zoom(zoom, delta);
+                                if (next - zoom).abs() > f32::EPSILON {
+                                    let bounds = this.dag_scroll.bounds();
+                                    let offset = crate::graph::anchored_offset(
+                                        this.dag_scroll.offset(),
+                                        bounds.origin,
+                                        pointer,
+                                        zoom,
+                                        next,
+                                    );
+                                    this.dag_zoom = Some(next);
+                                    this.dag_scroll.set_offset(offset);
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                    },
+                );
+                // The zoom cluster belongs to this canvas — the page draws it,
+                // so the page draws its controls too. `Fit` clears the stored
+                // zoom rather than computing one, so fitting follows the box
+                // again instead of freezing the size it had when pressed.
+                let zoom_bar = div()
+                    .absolute()
+                    .top(rems_from_px(8_f32))
+                    .right(rems_from_px(8_f32))
+                    .p(rems_from_px(2_f32))
+                    .rounded(rems_from_px(7_f32))
+                    .bg(c(p::CHROME))
+                    .border_1()
+                    .border_color(c(p::BORDER2))
+                    .child(crate::graph::zoom_controls(
+                        "page-dag",
+                        zoom,
+                        false,
+                        false,
+                        cx.listener(move |this, _, _, cx| {
+                            this.dag_zoom =
+                                Some(crate::graph::step_zoom(zoom, -crate::graph::zoom_limits().step));
+                            cx.notify();
+                        }),
+                        cx.listener(move |this, _, _, cx| {
+                            this.dag_zoom =
+                                Some(crate::graph::step_zoom(zoom, crate::graph::zoom_limits().step));
+                            cx.notify();
+                        }),
+                        cx.listener(|this, _, _, cx| {
+                            this.dag_zoom = None;
+                            cx.notify();
+                        }),
+                        |_: &gpui::ClickEvent, _: &mut Window, _: &mut App| {},
+                        cx,
+                    ));
                 div()
                     .id(("dag-scroll", index))
                     .relative()
@@ -1478,8 +1558,10 @@ impl MiniOrkPage {
                         self.dag_edge.clone(),
                         on_node,
                         on_edge,
+                        on_zoom,
                         cx,
                     ))
+                    .child(zoom_bar)
             }
             None => div()
                 .id(("dag-scroll", index))
@@ -1781,6 +1863,44 @@ impl MiniOrkPage {
             );
             self.composers.insert(index, Composer { editor, _sub });
         }
+    }
+
+    /// Zoom the flow map to `zoom`, keeping the point under the pointer where
+    /// it is. `before` is the zoom the pointer's position was measured at.
+    pub(crate) fn zoom_flow_from(
+        &mut self,
+        zoom: f32,
+        pointer: Point<Pixels>,
+        before: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let after = crate::graph::clamp_zoom(zoom);
+        if after == before {
+            return;
+        }
+        let offset = crate::graph::anchored_offset(
+            self.flow_scroll.offset(),
+            self.flow_scroll.bounds().origin,
+            pointer,
+            before,
+            after,
+        );
+        self.flow_zoom = after;
+        self.flow_scroll.set_offset(offset);
+        cx.notify();
+    }
+
+    /// Enlarge the flow map to the window — the map's own "Full screen".
+    pub(crate) fn open_flow_full(&mut self, cx: &mut Context<Self>) {
+        self.flow_full = true;
+        cx.notify();
+    }
+
+    /// Put the flow map back in the page. Escape and the enlarged map's own
+    /// Close both land here.
+    pub(crate) fn close_flow_full(&mut self, cx: &mut Context<Self>) {
+        self.flow_full = false;
+        cx.notify();
     }
 
     /// Open the run graph full screen, optionally on one node's stream.
@@ -2109,9 +2229,27 @@ impl Render for MiniOrkPage {
             }
         };
         self.texts.end();
+        // The flow map's own full screen: the same map, filling the window.
+        // Escape and the map's own Close put it back.
+        let flow_full_screen = self
+            .flow_full
+            .then(|| {
+                self.data
+                    .as_ref()
+                    .and_then(|data| data.as_ref().ok())
+                    .and_then(|page| page.get("flow"))
+                    .filter(|flow| flow.is_object())
+                    .map(|flow| crate::flow::render_flow_part_a(self, flow, &self.flow_scroll, window, cx))
+            })
+            .flatten();
         div()
             .id("mini-ork-page")
             .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(|page: &mut MiniOrkPage, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" && page.flow_full {
+                    page.close_flow_full(cx);
+                }
+            }))
             .size_full()
             .bg(c(p::BG))
             .text_color(c(p::TEXT))
@@ -2141,6 +2279,17 @@ impl Render for MiniOrkPage {
                             .child(graph),
                     )
                     .with_priority(100),
+                )
+            })
+            .when_some(flow_full_screen, |this, map| {
+                this.child(
+                    deferred(
+                        anchored()
+                            .position_mode(AnchoredPositionMode::Window)
+                            .position(point(px(0.), px(0.)))
+                            .child(div().size_full().bg(c(p::BG)).child(map)),
+                    )
+                    .with_priority(90),
                 )
             })
     }

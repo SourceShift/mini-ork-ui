@@ -8,14 +8,15 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
 use gpui::{
     AnimationExt as _, AnyElement, App, Bounds, ClickEvent, Context, DismissEvent, EventEmitter,
-    FocusHandle, Focusable, KeyDownEvent, PathBuilder, Pixels, Point, Render, ScrollHandle,
-    SharedString, Subscription, Task, WeakEntity, Window, canvas, fill, point, px, size,
+    FocusHandle, Focusable, KeyDownEvent, PathBuilder, PinchEvent, Pixels, Point, Render,
+    ScrollHandle, ScrollWheelEvent, SharedString, Subscription, Task, WeakEntity, Window, canvas,
+    fill, point, px, size,
 };
 use serde_json::Value;
 use ui::{CommonAnimationExt as _, DiffStat, prelude::*};
@@ -393,18 +394,155 @@ impl Model {
     }
 }
 
+// ── zoom ──────────────────────────────────────────────────────────────────
+//
+// One zoom vocabulary for every surface that draws a canvas: the buttons, the
+// wheel and the fit all clamp to the same range, so a graph can never be left
+// at a zoom no control can bring back, and the hosts cannot drift into three
+// sets of limits the way they had (`0.4..1.8` on the buttons, `0.4..1.0` on the
+// strip fit, `0.4..1.4` on the Fit button).
+
+pub(crate) const ZOOM_MIN: f32 = 0.4;
+pub(crate) const ZOOM_MAX: f32 = 2.0;
+/// One press of `−` or `+`.
+pub(crate) const ZOOM_STEP: f32 = 0.1;
+/// How much one notch of a wheel moves the zoom, per pixel of scroll.
+pub(crate) const ZOOM_WHEEL: f32 = 0.0025;
+
+/// The zoom range and press size this process uses: the constants above unless
+/// a deployment replaced them.
+#[derive(Clone, Copy)]
+pub(crate) struct ZoomLimits {
+    pub(crate) min: f32,
+    pub(crate) max: f32,
+    pub(crate) step: f32,
+}
+
+/// One `MINI_ORK_ZOOM_*` value, or `default` when it is absent, unparseable,
+/// not a number, or outside what the controls can undo. Falling back *is* the
+/// point: `MINI_ORK_ZOOM_MAX=0` has to read as "the default", never as a canvas
+/// drawn at no size, so a typo degrades to the shipped behaviour instead of to
+/// a blank pane.
+fn zoom_knob(raw: Option<&str>, default: f32, lowest: f32, highest: f32) -> f32 {
+    raw.and_then(|value| value.trim().parse::<f32>().ok())
+        .filter(|value| value.is_finite() && *value >= lowest && *value <= highest)
+        .unwrap_or(default)
+}
+
+/// The zoom range and press size, read from the environment once and cached.
+///
+/// `MINI_ORK_ZOOM_MIN` / `MINI_ORK_ZOOM_MAX` / `MINI_ORK_ZOOM_STEP` are for a
+/// deployment that pins a different range for everyone — a wall display, or a
+/// support session where the zoom must stop where it says it stops. Unset is
+/// the normal case and costs one `env::var` per process.
+pub(crate) fn zoom_limits() -> ZoomLimits {
+    static LIMITS: OnceLock<ZoomLimits> = OnceLock::new();
+    *LIMITS.get_or_init(|| {
+        let knob = |name: &str, default: f32, lowest: f32, highest: f32| {
+            zoom_knob(std::env::var(name).ok().as_deref(), default, lowest, highest)
+        };
+        let min = knob("MINI_ORK_ZOOM_MIN", ZOOM_MIN, 0.05, 4.);
+        let max = knob("MINI_ORK_ZOOM_MAX", ZOOM_MAX, 0.05, 4.);
+        let step = knob("MINI_ORK_ZOOM_STEP", ZOOM_STEP, 0.005, 1.);
+        // An inverted range is a misconfiguration, not a request for an empty
+        // one. The step is independent, so it survives either way.
+        if min < max {
+            ZoomLimits { min, max, step }
+        } else {
+            ZoomLimits { min: ZOOM_MIN, max: ZOOM_MAX, step }
+        }
+    })
+}
+
+/// A zoom inside the range the controls can reach. A value that is not a
+/// number at all — only reachable through a bad environment knob — reads as
+/// 1:1 rather than as a canvas drawn at no size.
+pub(crate) fn clamp_zoom(zoom: f32) -> f32 {
+    let limits = zoom_limits();
+    let sane = if zoom.is_finite() { zoom } else { 1. };
+    sane.clamp(limits.min, limits.max)
+}
+
+/// The zoom `delta` moves to, clamped to what the controls can undo.
+pub(crate) fn step_zoom(zoom: f32, delta: f32) -> f32 {
+    clamp_zoom(zoom + delta)
+}
+
+/// The zoom at which a `canvas_w`×`canvas_h` drawing fits a `viewport_w`×
+/// `viewport_h` viewport after `gutter` of chrome around it.
+///
+/// Every host that sizes a canvas to its box wants the same thing: the whole
+/// picture visible without panning, and never so small it cannot be read. A
+/// viewport that has not been laid out yet (nothing measured) reads as 1:1, so
+/// the frame before the first layout draws the canvas at its own size and the
+/// next frame corrects it.
+pub(crate) fn box_fit_zoom(
+    viewport_w: f32,
+    viewport_h: f32,
+    canvas_w: f32,
+    canvas_h: f32,
+    gutter: f32,
+) -> f32 {
+    let limits = zoom_limits();
+    if viewport_w <= gutter || viewport_h <= gutter || canvas_w <= 0. || canvas_h <= 0. {
+        return 1_f32.clamp(limits.min, limits.max);
+    }
+    ((viewport_w - gutter) / canvas_w)
+        .min((viewport_h - gutter) / canvas_h)
+        .clamp(limits.min, limits.max)
+}
+
+/// The scroll offset that keeps the point under `pointer` in place while the
+/// canvas scales from `old_zoom` to `new_zoom` — what makes a wheel zoom feel
+/// like it magnifies the spot the cursor is on rather than the top-left corner.
+///
+/// `pointer` is where the event landed, in window coordinates; `view_origin` is
+/// the scroll container's own. Only the *distance* from that origin matters, so
+/// the canvas' own padding cancels out and needs no term here.
+///
+/// A canvas point `c` is drawn at `c * zoom - offset`, so the point under the
+/// cursor is `(pointer_in_view + offset) / old_zoom`. Holding that point at the
+/// same place at the new zoom gives `offset' = ratio * (offset + in) - in`: the
+/// offset carries forward *scaled*, which the obvious
+/// `offset + in - in * ratio` gets wrong — it pans the canvas the other way and
+/// makes one `+` press feel like a drag.
+pub(crate) fn anchored_offset(
+    offset: Point<Pixels>,
+    view_origin: Point<Pixels>,
+    pointer: Point<Pixels>,
+    old_zoom: f32,
+    new_zoom: f32,
+) -> Point<Pixels> {
+    let ratio = if old_zoom > 0. { new_zoom / old_zoom } else { 1. };
+    let (in_x, in_y) = (
+        f32::from(pointer.x) - f32::from(view_origin.x),
+        f32::from(pointer.y) - f32::from(view_origin.y),
+    );
+    let (offset_x, offset_y) = (f32::from(offset.x), f32::from(offset.y));
+    point(
+        px(ratio * (offset_x + in_x) - in_x),
+        px(ratio * (offset_y + in_y) - in_y),
+    )
+}
+
 /// The zoom at which a run's whole DAG fits `width` after `gutter` of chrome.
 ///
 /// Both hosts that show the canvas unprompted (a node tab's strip, the run
 /// page's DAG section) want the same thing: the rightmost node visible without
 /// panning, and never blown up past 1:1 — a three-node recipe stretched to fill
-/// a window reads as a different picture of the same run.
+/// a window reads as a different picture of the same run. That is stricter than
+/// `box_fit_zoom`, which may enlarge: this one is what the strip opens on, and
+/// it may only shrink.
 pub(crate) fn fit_zoom(width: f32, model: &Model, gutter: f32) -> f32 {
+    let limits = zoom_limits();
+    // A pinned range whose floor is above 1:1 would make `clamp(min, 1.)` an
+    // inverted range, which panics. The ceiling never drops below the floor.
+    let ceiling = 1_f32.max(limits.min);
     let w = model.width();
     if width <= gutter || w <= 0. {
-        return 1.;
+        return ceiling;
     }
-    ((width - gutter) / w).clamp(0.4, 1.)
+    ((width - gutter) / w).clamp(limits.min, ceiling)
 }
 
 /// Where along a node's side each of the edges that use that side meets it, as
@@ -475,6 +613,101 @@ const COLLAPSED_LINES: usize = 4;
 /// keeps that bounded, with "show earlier" to extend it.
 const STREAM_WINDOW: usize = 400;
 
+/// The zoom controls every canvas host draws: `−`, the percentage, `+`, `Fit`
+/// and — only where the host has no full-screen control of its own — the
+/// toggle that fills the pane. One definition, so the header, a node tab's
+/// strip and the run page's canvas cannot drift into three zoom controls with
+/// three different ranges.
+///
+/// No background of its own: in a header the cluster sits on the chrome bar and
+/// reads as part of it, and a host that floats it over a canvas wraps it in its
+/// own plate (see the tab strip's overlay).
+pub(crate) fn zoom_controls(
+    id: &'static str,
+    zoom: f32,
+    maximized: bool,
+    with_maximize: bool,
+    on_out: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_in: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_fit: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_maximize: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> impl IntoElement {
+    let mono = p::mono_font(cx);
+    let square = move |suffix: &str, label: SharedString, handler: Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>| {
+        div()
+            .id(SharedString::from(format!("{id}-{suffix}")))
+            .size(rems_from_px(26_f32))
+            .flex()
+            .items_center()
+            .justify_center()
+            .border_1()
+            .border_color(c(p::BORDER2))
+            .text_color(c(p::TEXT))
+            .cursor_pointer()
+            .hover(|s| s.bg(c(p::HOVER)))
+            .child(label)
+            .on_click(handler)
+    };
+    let mut row = h_flex()
+        .gap_0p5()
+        .child(square("zoom-out", "−".into(), Box::new(on_out)))
+        .child(
+            div()
+                .w(rems_from_px(46_f32))
+                .text_center()
+                .text_size(rems_from_px(11.5_f32))
+                .font(mono)
+                .text_color(c(p::MUTED))
+                .child(format!("{}%", (zoom * 100.).round() as i32)),
+        )
+        .child(square("zoom-in", "+".into(), Box::new(on_in)))
+        .child(
+            div()
+                .id(SharedString::from(format!("{id}-fit")))
+                .ml_1()
+                .h(rems_from_px(26_f32))
+                .px(rems_from_px(9_f32))
+                .flex()
+                .items_center()
+                .border_1()
+                .border_color(c(p::BORDER2))
+                .text_size(rems_from_px(12_f32))
+                .text_color(c(p::TEXT))
+                .cursor_pointer()
+                .hover(|s| s.bg(c(p::HOVER)))
+                .child("Fit")
+                .on_click(on_fit),
+        );
+    if with_maximize {
+        row = row.child(
+            div()
+                .id(SharedString::from(format!("{id}-maximize")))
+                .ml_1()
+                .size(rems_from_px(26_f32))
+                .flex()
+                .items_center()
+                .justify_center()
+                .border_1()
+                .border_color(c(p::BORDER2))
+                .cursor_pointer()
+                .hover(|s| s.bg(c(p::HOVER)))
+                .tooltip(ui::Tooltip::text(if maximized {
+                    "Back to the strip"
+                } else {
+                    "Full screen · inspect every node"
+                }))
+                .child(
+                    Icon::new(if maximized { IconName::Minimize } else { IconName::MaximizeAlt })
+                        .size(IconSize::Small)
+                        .color(c(p::MUTED).into()),
+                )
+                .on_click(on_maximize),
+        );
+    }
+    row
+}
+
 fn mark(state: &str) -> (&'static str, u32) {
     match state {
         "done" => ("✓", p::GREEN),
@@ -500,6 +733,11 @@ pub struct MiniOrkGraph {
     model: Model,
     list_view: bool,
     zoom: f32,
+    /// The reader set this zoom themselves (buttons, wheel, pinch), so the
+    /// strip's own fit must not overwrite it: a reload would otherwise throw
+    /// away what they were looking at. `Fit` clears it again, which is what
+    /// makes the fit sticky rather than merely initial.
+    zoom_touched: bool,
     filter: Arc<dyn ErasedEditor>,
     query: String,
     canvas_scroll: ScrollHandle,
@@ -549,6 +787,15 @@ pub struct MiniOrkGraph {
     /// graph the inspector expands over the canvas it normally sits beside.
     /// Toggled from the stream's own header; escape clears it.
     stream_full: bool,
+    /// The node tab's graph has filled the tab: the strip and the inspector
+    /// give way to the full-window canvas — header, zoom, Close — and Escape
+    /// or Close brings them back. Only a node tab sets this; a run page's
+    /// strip has its own full-screen control, which opens the window overlay.
+    maximized: bool,
+    /// Hosted by a node tab rather than a run page's strip. The tab *is* the
+    /// frame there, so Close comes back from full screen instead of dismissing
+    /// a host that does not exist.
+    pub(crate) in_node_tab: bool,
     _load: Task<()>,
     _subs: Vec<Subscription>,
 }
@@ -600,6 +847,7 @@ impl MiniOrkGraph {
             model,
             list_view: false,
             zoom: 1.0,
+            zoom_touched: false,
             filter,
             query: String::new(),
             canvas_scroll: ScrollHandle::new(),
@@ -625,6 +873,8 @@ impl MiniOrkGraph {
             strip_only: false,
             tab_fit: false,
             stream_full: false,
+            maximized: false,
+            in_node_tab: false,
             _load: Task::ready(()),
             _subs: vec![filter_sub],
         };
@@ -637,9 +887,63 @@ impl MiniOrkGraph {
     /// The page re-read the run: node states, costs and durations move on.
     pub fn set_model(&mut self, model: Model, cx: &mut Context<Self>) {
         self.model = model;
-        if self.tab_mode {
+        if self.tab_mode && !self.zoom_touched {
             self.tab_fit = false; // the graph may be wider now: re-fit
         }
+        cx.notify();
+    }
+
+    /// One step of the shared zoom, from a button or a turn of the wheel.
+    fn zoom_by(&mut self, delta: f32, cx: &mut Context<Self>) {
+        self.set_zoom(step_zoom(self.zoom, delta), cx);
+    }
+
+    /// A zoom the reader asked for: kept, and never re-fitted away.
+    fn set_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {
+        let zoom = clamp_zoom(zoom);
+        if (zoom - self.zoom).abs() > f32::EPSILON {
+            self.zoom = zoom;
+            self.zoom_touched = true;
+            cx.notify();
+        }
+    }
+
+    /// The wheel over the canvas: the same zoom, but the point under the
+    /// pointer stays where it is, so the gesture magnifies what the cursor is
+    /// on rather than the canvas' top-left corner.
+    fn zoom_at(&mut self, delta: f32, pointer: Point<Pixels>, cx: &mut Context<Self>) {
+        let zoom = step_zoom(self.zoom, delta);
+        if (zoom - self.zoom).abs() <= f32::EPSILON {
+            return;
+        }
+        let bounds = self.canvas_scroll.bounds();
+        let offset = anchored_offset(self.canvas_scroll.offset(), bounds.origin, pointer, self.zoom, zoom);
+        self.zoom = zoom;
+        self.zoom_touched = true;
+        self.canvas_scroll.set_offset(offset);
+        cx.notify();
+    }
+
+    /// Fit the whole graph into the box the canvas actually got.
+    fn zoom_fit(&mut self, cx: &mut Context<Self>) {
+        let view = self.canvas_scroll.bounds().size;
+        let (w, h) = (f32::from(view.width), f32::from(view.height));
+        if w <= 0. || h <= 0. {
+            return;
+        }
+        self.zoom = box_fit_zoom(w, h, self.model.width(), self.model.height(), CANVAS_PAD * 2.);
+        // The fit may be redone by a reload: it follows the graph, and a graph
+        // that grew must be fitted again.
+        self.zoom_touched = false;
+        cx.notify();
+    }
+
+    /// The tab's graph fills the tab, or comes back to the strip. The focus
+    /// moves with it: the strip belongs to the tab, and the full view's keys —
+    /// escape first among them — are read by the graph itself.
+    fn toggle_maximized(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.maximized = !self.maximized;
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
@@ -656,6 +960,13 @@ impl MiniOrkGraph {
     }
 
     fn close(&mut self, cx: &mut Context<Self>) {
+        if self.in_node_tab {
+            // A node tab is its own frame: Close leaves full screen rather
+            // than dismissing a host that is not there.
+            self.maximized = false;
+            cx.notify();
+            return;
+        }
         cx.emit(DismissEvent);
     }
 
@@ -889,20 +1200,6 @@ impl MiniOrkGraph {
         ];
         let (m, mc) = mark(if self.model.state.contains("running") { "running" } else if self.model.state.contains("fail") { "failed" } else { "done" });
         let mono = p::mono_font(cx);
-        let small = |id: &'static str, label: &'static str| {
-            div()
-                .id(id)
-                .size(rems_from_px(26_f32))
-                .flex()
-                .items_center()
-                .justify_center()
-                .border_1()
-                .border_color(c(p::BORDER2))
-                .text_color(c(p::TEXT))
-                .cursor_pointer()
-                .hover(|s| s.bg(c(p::HOVER)))
-                .child(label)
-        };
         h_flex()
             .flex_none()
             .h(rems_from_px(46_f32))
@@ -972,70 +1269,41 @@ impl MiniOrkGraph {
                     .text_size(rems_from_px(12.5_f32))
                     .child(self.filter.render(window, cx)),
             )
-            .when(!self.list_view, |this| {
+            .child(zoom_controls(
+                "graph",
+                self.zoom,
+                self.maximized,
+                // Only a node tab has no full-screen control of its own: the
+                // window overlay is already full screen, and a run page's strip
+                // carries the page's own button.
+                self.in_node_tab,
+                cx.listener(|this, _, _, cx| this.zoom_by(-zoom_limits().step, cx)),
+                cx.listener(|this, _, _, cx| this.zoom_by(zoom_limits().step, cx)),
+                cx.listener(|this, _, _, cx| this.zoom_fit(cx)),
+                cx.listener(|this, _, window, cx| this.toggle_maximized(window, cx)),
+                cx,
+            ))
+            .when(!(self.in_node_tab && !self.maximized), |this| {
+                // A node tab's normal view has nothing to dismiss — the tab
+                // itself is the frame — so its Close belongs to the maximized
+                // view alone, where it goes back to the strip.
                 this.child(
-                    h_flex()
-                        .gap_0p5()
-                        .child(small("graph-zoom-out", "−").on_click(cx.listener(|this, _, _, cx| {
-                            this.zoom = (this.zoom - 0.1).max(0.4);
-                            cx.notify();
-                        })))
-                        .child(
-                            div()
-                                .w(rems_from_px(46_f32))
-                                .text_center()
-                                .text_size(rems_from_px(11.5_f32))
-                                .font(mono.clone())
-                                .text_color(c(p::MUTED))
-                                .child(format!("{}%", (self.zoom * 100.).round() as i32)),
-                        )
-                        .child(small("graph-zoom-in", "+").on_click(cx.listener(|this, _, _, cx| {
-                            this.zoom = (this.zoom + 0.1).min(1.8);
-                            cx.notify();
-                        })))
-                        .child(
-                            div()
-                                .id("graph-fit")
-                                .ml_1()
-                                .h(rems_from_px(26_f32))
-                                .px(rems_from_px(9_f32))
-                                .flex()
-                                .items_center()
-                                .border_1()
-                                .border_color(c(p::BORDER2))
-                                .text_size(rems_from_px(12_f32))
-                                .text_color(c(p::TEXT))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(c(p::HOVER)))
-                                .child("Fit")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    let view = this.canvas_scroll.bounds().size;
-                                    let (w, h) = (this.model.width(), this.model.height());
-                                    if f32::from(view.width) > 0. {
-                                        let z = ((f32::from(view.width) - 56.) / w).min((f32::from(view.height) - 56.) / h);
-                                        this.zoom = (z.clamp(0.4, 1.4) * 100.).round() / 100.;
-                                        cx.notify();
-                                    }
-                                })),
-                        ),
+                    div()
+                        .id("graph-close")
+                        .h_7()
+                        .px_2p5()
+                        .flex()
+                        .items_center()
+                        .border_1()
+                        .border_color(c(p::BORDER2))
+                        .bg(c(p::HOVER))
+                        .text_size(rems_from_px(12.5_f32))
+                        .text_color(c(p::TEXT))
+                        .cursor_pointer()
+                        .child("✕ Close")
+                        .on_click(cx.listener(|this, _, _, cx| this.close(cx))),
                 )
             })
-            .child(
-                div()
-                    .id("graph-close")
-                    .h_7()
-                    .px_2p5()
-                    .flex()
-                    .items_center()
-                    .border_1()
-                    .border_color(c(p::BORDER2))
-                    .bg(c(p::HOVER))
-                    .text_size(rems_from_px(12.5_f32))
-                    .text_color(c(p::TEXT))
-                    .cursor_pointer()
-                    .child("✕ Close")
-                    .on_click(cx.listener(|this, _, _, cx| this.close(cx))),
-            )
             .into_any_element()
     }
 }
@@ -1066,14 +1334,20 @@ impl MiniOrkGraph {
                 this.update(cx, |this, cx| this.select(node.to_string(), cx)).ok();
             }
         });
-        let on_edge = std::rc::Rc::new(move |edge: Option<(String, String)>, _: &mut Window, cx: &mut App| {
-            this.update(cx, |this, cx| {
-                if this.selected_edge != edge {
-                    this.selected_edge = edge;
-                    cx.notify();
-                }
-            })
-            .ok();
+        let on_edge = std::rc::Rc::new({
+            let this = this.clone();
+            move |edge: Option<(String, String)>, _: &mut Window, cx: &mut App| {
+                this.update(cx, |this, cx| {
+                    if this.selected_edge != edge {
+                        this.selected_edge = edge;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+        });
+        let on_zoom = std::rc::Rc::new(move |delta: f32, pointer: Point<Pixels>, _: &mut Window, cx: &mut App| {
+            this.update(cx, |this, cx| this.zoom_at(delta, pointer, cx)).ok();
         });
         render_canvas(
             &self.model,
@@ -1085,6 +1359,7 @@ impl MiniOrkGraph {
             self.selected_edge.clone(),
             on_node,
             on_edge,
+            on_zoom,
             cx,
         )
     }
@@ -1112,6 +1387,9 @@ pub(crate) fn render_canvas(
     selected_edge: Option<(String, String)>,
     on_node: std::rc::Rc<dyn Fn(&str, &mut Window, &mut App)>,
     on_edge: std::rc::Rc<dyn Fn(Option<(String, String)>, &mut Window, &mut App)>,
+    // A zoom gesture landed on the canvas: how much, and where. The host owns
+    // the zoom and the scroll handle, so the canvas only reports.
+    on_zoom: std::rc::Rc<dyn Fn(f32, Point<Pixels>, &mut Window, &mut App)>,
     cx: &mut App,
 ) -> AnyElement {
     // The state this canvas reads is the renderer's, not the store's: owned
@@ -1419,6 +1697,35 @@ pub(crate) fn render_canvas(
                                 .relative()
                                 .w(px(w))
                                 .h(px(h))
+                                // ⌘/ctrl + wheel, and a trackpad pinch, zoom about
+                                // the pointer. The listener sits on the canvas
+                                // inside the scroller on purpose: the bubble phase
+                                // reaches it before the scroller's own handler, so
+                                // it can stop the event before the same gesture is
+                                // turned into a pan. A plain wheel is left alone —
+                                // it is how the canvas is scrolled.
+                                .on_scroll_wheel({
+                                    let on_zoom = on_zoom.clone();
+                                    move |event: &ScrollWheelEvent, window: &mut Window, cx: &mut App| {
+                                        if !(event.modifiers.secondary() || event.modifiers.control) {
+                                            return;
+                                        }
+                                        let delta = event.delta.pixel_delta(window.line_height());
+                                        let step = -f32::from(delta.y) * ZOOM_WHEEL;
+                                        if step == 0. {
+                                            return;
+                                        }
+                                        (on_zoom)(step, event.position, window, cx);
+                                        cx.stop_propagation();
+                                    }
+                                })
+                                .on_pinch({
+                                    let on_zoom = on_zoom.clone();
+                                    move |event: &PinchEvent, window: &mut Window, cx: &mut App| {
+                                        (on_zoom)(event.delta, event.position, window, cx);
+                                        cx.stop_propagation();
+                                    }
+                                })
                                 .child(edges)
                                 .children(heads)
                                 .children(nodes),
@@ -1431,11 +1738,15 @@ pub(crate) fn render_canvas(
 impl MiniOrkGraph {
     fn render_list(&self, cx: &mut Context<Self>) -> AnyElement {
         let mono = p::mono_font(cx);
+        // The rows are measured in pixels, so the zoom is a multiplier on them
+        // rather than something the layout could apply for us: the List reads
+        // at the same scale as the canvas beside it.
+        let k = self.zoom;
         let stages = self.model.cols.iter().enumerate().map(|(ci, col)| {
             let head = self.model.heads.get(ci).cloned().unwrap_or_default();
             v_flex()
-                .gap_1()
-                .child(p::text(format!("{} · {}", ci + 1, head).to_uppercase(), 10.5, p::DIM))
+                .gap(rems_from_px(4. * k))
+                .child(p::text(format!("{} · {}", ci + 1, head).to_uppercase(), 10.5 * k, p::DIM))
                 .children(col.iter().map(|n| {
                     let on = self.selected.as_deref() == Some(n.id.as_str());
                     let (m, mc) = mark(&n.state);
@@ -1443,17 +1754,17 @@ impl MiniOrkGraph {
                     let id = n.id.clone();
                     h_flex()
                         .id(SharedString::from(format!("graph-row-{}", n.id)))
-                        .gap_2p5()
-                        .px_3()
-                        .py_2()
+                        .gap(rems_from_px(10. * k))
+                        .px(rems_from_px(12. * k))
+                        .py(rems_from_px(8. * k))
                         .border_1()
                         .border_color(if on { c(p::BLUE) } else { c(p::BORDER2) })
                         .bg(c(if pending { 0x2a2e36 } else { 0x323843 }))
                         .when(!self.matches(n), |this| this.opacity(0.28))
                         .cursor_pointer()
                         .hover(|s| s.border_color(c(p::BLUE)))
-                        .text_size(rems_from_px(12.5_f32))
-                        .child(p::text(m, 11., mc).w_4().flex_none())
+                        .text_size(rems_from_px(12.5 * k))
+                        .child(p::text(m, 11. * k, mc).w(rems_from_px(16. * k)).flex_none())
                         .child(
                             div()
                                 .flex_1()
@@ -1465,18 +1776,18 @@ impl MiniOrkGraph {
                         )
                         .child(
                             h_flex()
-                                .w(rems_from_px(120_f32))
+                                .w(rems_from_px(120. * k))
                                 .flex_none()
-                                .gap(rems_from_px(5_f32))
-                                .child(p::lane_mark(&n.lane, 11.))
-                                .child(p::text(p::lane_label(&n.lane), 11.5, p::TEXT).truncate())
+                                .gap(rems_from_px(5. * k))
+                                .child(p::lane_mark(&n.lane, 11. * k))
+                                .child(p::text(p::lane_label(&n.lane), 11.5 * k, p::TEXT).truncate())
                                 .when(!n.role.is_empty(), |this| {
-                                    this.child(p::text(format!("· {}", n.role), 11.5, p::SUB).truncate())
+                                    this.child(p::text(format!("· {}", n.role), 11.5 * k, p::SUB).truncate())
                                 }),
                         )
-                        .child(p::text(state_text(&n.state).to_string(), 11.5, mc).w_20().flex_none())
-                        .child(p::text(n.cost.clone(), 11.5, p::SUB).font(mono.clone()).w(rems_from_px(60_f32)).flex_none())
-                        .child(p::text(n.dur.clone(), 11.5, p::SUB).font(mono.clone()).w(rems_from_px(60_f32)).flex_none())
+                        .child(p::text(state_text(&n.state).to_string(), 11.5 * k, mc).w(rems_from_px(80. * k)).flex_none())
+                        .child(p::text(n.cost.clone(), 11.5 * k, p::SUB).font(mono.clone()).w(rems_from_px(60. * k)).flex_none())
+                        .child(p::text(n.dur.clone(), 11.5 * k, p::SUB).font(mono.clone()).w(rems_from_px(60. * k)).flex_none())
                         .on_click(cx.listener(move |this, _, _, cx| this.select(id.clone(), cx)))
                 }))
         });
@@ -2682,7 +2993,12 @@ impl Render for MiniOrkGraph {
         self.texts.begin();
         let viewport = window.viewport_size();
         let selected = self.selected.as_ref().and_then(|id| self.node(id)).cloned();
-        if self.tab_mode {
+        // A maximized node tab is the window graph, drawn into the tab: the
+        // same canvas, header, zoom and Close, with the strip and the inspector
+        // out of the way. It falls through to the branch below rather than
+        // being a third layout, so full screen cannot drift from the window
+        // overlay's.
+        if self.tab_mode && !self.maximized {
             // A node tab leads with the run's DAG — the node highlighted, its
             // edges blue — then the node's own detail underneath. Reusing the
             // full-screen canvas keeps the two from drifting; only the height
@@ -2712,9 +3028,35 @@ impl Render for MiniOrkGraph {
                     .flex_none()
                     .h(px(NODE_TAB_DAG_H))
                     .min_h_0()
+                    .relative()
                     .border_b_1()
                     .border_color(c(p::BORDER))
                     .child(if self.list_view { self.render_list(cx) } else { self.render_graph(cx) })
+                    // The strip carries no header to hold the zoom, so the
+                    // cluster floats over the canvas, top-right — the only
+                    // corner its hosts leave free.
+                    .child(
+                        div()
+                            .absolute()
+                            .top(rems_from_px(6_f32))
+                            .right(rems_from_px(6_f32))
+                            .p(rems_from_px(2_f32))
+                            .rounded(rems_from_px(7_f32))
+                            .bg(c(p::CHROME))
+                            .border_1()
+                            .border_color(c(p::BORDER2))
+                            .child(zoom_controls(
+                                "strip",
+                                self.zoom,
+                                self.maximized,
+                                self.in_node_tab,
+                                cx.listener(|this, _, _, cx| this.zoom_by(-zoom_limits().step, cx)),
+                                cx.listener(|this, _, _, cx| this.zoom_by(zoom_limits().step, cx)),
+                                cx.listener(|this, _, _, cx| this.zoom_fit(cx)),
+                                cx.listener(|this, _, window, cx| this.toggle_maximized(window, cx)),
+                                cx,
+                            )),
+                    )
             });
             // The run page's strip is the canvas alone: the page draws the
             // breadcrumb, tabs and sections under it, so nothing here may take
@@ -2761,7 +3103,10 @@ impl Render for MiniOrkGraph {
             .key_context("MiniOrkRunGraph")
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" {
-                    if this.stream_full {
+                    if this.maximized {
+                        this.maximized = false;
+                        cx.notify();
+                    } else if this.stream_full {
                         this.stream_full = false;
                         cx.notify();
                     } else if this.selected.is_some() {
@@ -2772,11 +3117,15 @@ impl Render for MiniOrkGraph {
                     }
                 }
             }))
-            .w(viewport.width)
-            .h(viewport.height)
+            // The window overlay is the size of the window; a node tab that has
+            // maximized is the size of the tab, and filling that is what
+            // "full screen" means there.
+            .when(self.maximized, |this| this.size_full())
+            .when(!self.maximized, |this| {
+                this.w(viewport.width).h(viewport.height).occlude()
+            })
             .bg(c(p::BG))
             .text_color(c(p::TEXT))
-            .occlude()
             .child(header)
             .child(h_flex().flex_1().min_h_0().items_stretch().children(canvas).children(inspector))
             .with_animation(
@@ -2987,5 +3336,135 @@ mod tests {
                 ],
             }
         })
+    }
+
+    // ── the zoom maths ──────────────────────────────────────────────────────
+    //
+    // Every surface (the run graph, the List view, a node tab's strip and the
+    // flow map) reads these four, so the properties that matter are the ones a
+    // corrupt or out-of-range value must not break: a zoom is always a finite
+    // number inside the bounds, and the fit never leaves them either.
+
+    #[test]
+    fn clamp_zoom_lands_a_junk_value_inside_the_bounds() {
+        // A value that is not a number at all reads as 1:1 rather than as a
+        // bound: only a bad environment knob reaches here, and the plain
+        // drawing is the safer recovery than an extreme zoom nobody asked for.
+        assert_eq!(clamp_zoom(f32::NAN), 1., "a NaN zoom is the plain drawing, not a blank canvas");
+        assert_eq!(clamp_zoom(f32::INFINITY), 1.);
+        assert_eq!(clamp_zoom(f32::NEG_INFINITY), 1.);
+        assert_eq!(clamp_zoom(0.), ZOOM_MIN);
+        assert_eq!(clamp_zoom(-1.), ZOOM_MIN);
+        assert_eq!(clamp_zoom(1e9), ZOOM_MAX);
+        assert_eq!(clamp_zoom(1.25), 1.25, "a value already in range is kept exactly");
+    }
+
+    #[test]
+    fn step_zoom_saturates_at_both_ends() {
+        assert_eq!(step_zoom(1., ZOOM_STEP), 1. + ZOOM_STEP);
+        assert_eq!(step_zoom(ZOOM_MAX, ZOOM_STEP), ZOOM_MAX);
+        assert_eq!(step_zoom(ZOOM_MIN, -ZOOM_STEP), ZOOM_MIN);
+        // stepping from just inside the bound still moves, rather than sticking
+        assert!(step_zoom(ZOOM_MAX - ZOOM_STEP / 2., ZOOM_STEP) > ZOOM_MAX - ZOOM_STEP);
+    }
+
+    #[test]
+    fn box_fit_zoom_takes_the_tighter_of_the_two_ratios() {
+        // a canvas wider than the box: the width ratio is the binding one
+        assert_eq!(box_fit_zoom(400., 1000., 800., 100., 0.), 0.5);
+        // a canvas taller than the box: the height ratio binds
+        assert_eq!(box_fit_zoom(1000., 400., 100., 800., 0.), 0.5);
+        // the gutter is taken off the box before the ratio is read
+        assert_eq!(box_fit_zoom(400., 1000., 800., 100., 40.), (400. - 40.) / 800.);
+    }
+
+    #[test]
+    fn box_fit_zoom_never_leaves_the_bounds_nor_divides_by_nothing() {
+        // a canvas smaller than the box would fit at >1 — allowed, but capped
+        assert_eq!(box_fit_zoom(4000., 4000., 100., 100., 0.), ZOOM_MAX);
+        // a canvas far larger than the box would fit below the floor
+        assert_eq!(box_fit_zoom(10., 10., 10_000., 10_000., 0.), ZOOM_MIN);
+        // a box with no room for the gutter, or a canvas with no size
+        assert_eq!(box_fit_zoom(10., 10., 100., 100., 10.), 1.);
+        assert_eq!(box_fit_zoom(400., 400., 0., 100., 0.), 1.);
+        assert_eq!(box_fit_zoom(0., 0., 100., 100., 0.), 1.);
+    }
+
+    #[test]
+    fn anchored_offset_holds_the_point_under_the_pointer() {
+        let origin = point(px(0.), px(0.));
+        let pointer = point(px(100.), px(50.));
+        let start = point(px(0.), px(0.));
+        // at the same zoom nothing moves
+        assert_eq!(anchored_offset(start, origin, pointer, 1., 1.), start);
+        // Doubling about a cursor 100px in, from a zero offset: the content
+        // point under the cursor (100) must land back at 100, and at 2× that
+        // means an offset of +100 — the canvas moves *with* the cursor, which
+        // is the opposite sign to `offset + in - in * ratio`.
+        assert_eq!(anchored_offset(start, origin, pointer, 1., 2.), point(px(100.), px(50.)));
+        // The invariant behind that number: the content coordinate under the
+        // cursor is (in + offset) / zoom, before and after the zoom alike.
+        let under_cursor = |offset: Point<Pixels>, zoom: f32| -> (f32, f32) {
+            (
+                (f32::from(pointer.x) - f32::from(origin.x) + f32::from(offset.x)) / zoom,
+                (f32::from(pointer.y) - f32::from(origin.y) + f32::from(offset.y)) / zoom,
+            )
+        };
+        let before = under_cursor(start, 1.);
+        let there = anchored_offset(start, origin, pointer, 1., 2.);
+        let after = under_cursor(there, 2.);
+        assert!(
+            (after.0 - before.0).abs() < 0.01 && (after.1 - before.1).abs() < 0.01,
+            "the point under the cursor moved: {before:?} -> {after:?}"
+        );
+        // and both halves of the gesture are reversible
+        assert_eq!(anchored_offset(there, origin, pointer, 2., 1.), start);
+    }
+
+    #[test]
+    fn anchored_offset_reads_the_pointer_against_the_view_not_the_window() {
+        // the same gesture in a pane that starts at x=200: the pointer's
+        // distance *inside* the view is what counts, so the pointer at 300 is
+        // 100 in and the offset is the same as the zero-origin case above —
+        // the pane's own position cancels out
+        let origin = point(px(200.), px(0.));
+        let pointer = point(px(300.), px(50.));
+        assert_eq!(
+            anchored_offset(point(px(0.), px(0.)), origin, pointer, 1., 2.),
+            point(px(100.), px(50.))
+        );
+    }
+
+    #[test]
+    fn a_zoom_knob_falls_back_to_the_default_on_anything_it_cannot_use() {
+        // The point of the knobs is that a typo is survivable, so every way of
+        // being wrong reads as the shipped value: absent, empty, not a number,
+        // a NaN spelled out, an infinity, and either end of the range the
+        // controls cannot undo. None of these may reach the drawing.
+        assert_eq!(zoom_knob(None, 0.4, 0.05, 4.), 0.4);
+        assert_eq!(zoom_knob(Some(""), 0.4, 0.05, 4.), 0.4);
+        assert_eq!(zoom_knob(Some("wide"), 0.4, 0.05, 4.), 0.4);
+        assert_eq!(zoom_knob(Some("NaN"), 0.4, 0.05, 4.), 0.4);
+        assert_eq!(zoom_knob(Some("inf"), 0.4, 0.05, 4.), 0.4);
+        assert_eq!(zoom_knob(Some("-inf"), 0.4, 0.05, 4.), 0.4);
+        assert_eq!(zoom_knob(Some("0"), 0.4, 0.05, 4.), 0.4);
+        assert_eq!(zoom_knob(Some("-2"), 0.4, 0.05, 4.), 0.4);
+        assert_eq!(zoom_knob(Some("9"), 0.4, 0.05, 4.), 0.4);
+        assert_eq!(zoom_knob(Some("1e9"), 0.4, 0.05, 4.), 0.4);
+        // and a value it can use is taken as given, whitespace and all
+        assert_eq!(zoom_knob(Some("1.5"), 0.4, 0.05, 4.), 1.5);
+        assert_eq!(zoom_knob(Some(" 2.5 "), 0.4, 0.05, 4.), 2.5);
+        assert_eq!(zoom_knob(Some("0.05"), 0.4, 0.05, 4.), 0.05, "the bounds are inclusive");
+    }
+
+    #[test]
+    fn the_limits_are_the_defaults_when_nothing_pins_them() {
+        // These tests run without the knobs set, so the resolved limits have to
+        // be the constants every other assertion in this module is written
+        // against — a `OnceLock` that read something else would be a silent
+        // behaviour change under every other test here.
+        let limits = zoom_limits();
+        assert_eq!((limits.min, limits.max, limits.step), (ZOOM_MIN, ZOOM_MAX, ZOOM_STEP));
+        assert!(limits.min < limits.max, "an inverted range would panic every clamp");
     }
 }

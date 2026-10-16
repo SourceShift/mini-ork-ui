@@ -76,6 +76,9 @@ impl MiniOrkNodeTab {
         let graph = cx.new(|cx| {
             let mut graph = MiniOrkGraph::new(model, node, workspace, page, window, cx);
             graph.tab_mode = true;
+            // The tab is the frame here, so the strip's graph carries the
+            // toggle that fills it (and Close, up there, comes back).
+            graph.in_node_tab = true;
             graph
         });
         cx.observe(&graph, |_, _, cx| cx.notify()).detach();
