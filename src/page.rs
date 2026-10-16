@@ -1140,15 +1140,20 @@ impl MiniOrkPage {
                         )
                     })
                     .when(!acts.is_empty(), |this| {
-                        // The row's actions are all ghost buttons: the Orca
-                        // list keeps its weight in the title, not the chrome.
+                        // A row's actions are ghost by default: the Orca list
+                        // keeps its weight in the title, not the chrome. A key
+                        // that names its own kind gets it — a page that marks
+                        // its one real action `primary` means it, and drawing
+                        // it ghost buries the row's whole purpose in chrome.
                         this.child(h_flex().flex_none().gap(rems_from_px(5_f32)).children(acts.iter().enumerate().map(
                             |(a, b)| {
                                 let handler = self.action_handler(b.get("do"), cx);
+                                let named_kind = str_of(b, "kind");
+                                let kind = if named_kind.is_empty() { "ghost" } else { &named_kind };
                                 p::button(
                                     SharedString::from(format!("s{index}-i{i}-a{a}")),
                                     str_of(b, "label"),
-                                    "ghost",
+                                    kind,
                                     22.,
                                     11.5,
                                     handler,

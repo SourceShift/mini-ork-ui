@@ -18,6 +18,22 @@ use crate::{
     store::{self, Origin},
 };
 
+/// A check row's action button label, derived from what the action does.
+///
+/// `check_row`'s `do` is a bare action (`mini_ork/ide_pages/spec.py`), carrying
+/// no label the way `btn` does — so the label is read off the action's kind.
+fn check_action_label(action: &Value) -> &'static str {
+    if action.get("cli").is_some() {
+        "Run"
+    } else if action.get("run").is_some() {
+        "Open run"
+    } else if action.get("diff").is_some() {
+        "Diff"
+    } else {
+        "Open"
+    }
+}
+
 impl MiniOrkPage {
     pub(crate) fn render_triage(&self, index: usize, s: &Value, cx: &mut Context<Self>) -> AnyElement {
         let tone = str_of(s, "tone");
@@ -1076,6 +1092,11 @@ impl MiniOrkPage {
         let passing = summary_obj.get("passing").and_then(Value::as_u64).unwrap_or(0);
         let failing = summary_obj.get("failing").and_then(Value::as_u64).unwrap_or(0);
         let pending = summary_obj.get("pending").and_then(Value::as_u64).unwrap_or(0);
+        // The emitter counts a fourth class — a state that is none of
+        // pass/fail/pending — and reports it as `na`. Drawing only the first
+        // three made the header disagree with its own rows, so `na` is shown
+        // whenever there is one.
+        let na = summary_obj.get("na").and_then(Value::as_u64).unwrap_or(0);
         col = col.child(
             h_flex()
                 .gap_3p5()
@@ -1101,7 +1122,16 @@ impl MiniOrkPage {
                         .text_size(rems_from_px(12_f32))
                         .text_color(c(p::YELLOW))
                         .child(SharedString::from(format!("● {pending} pending"))),
-                ),
+                )
+                .when(na > 0, |this| {
+                    this.child(
+                        div()
+                            .flex_none()
+                            .text_size(rems_from_px(12_f32))
+                            .text_color(c(p::SUB))
+                            .child(SharedString::from(format!("○ {na} n/a"))),
+                    )
+                }),
         );
 
         for (i, row) in rows.iter().enumerate() {
@@ -1120,6 +1150,14 @@ impl MiniOrkPage {
                 "pending" | "running" => ("●", p::c(p::YELLOW)),
                 _ => ("○", p::c(p::SUB)),
             };
+
+            // A row may carry its own action (`check_row(..., do=…)`). The `do`
+            // is a bare action with no label of its own, so the button's label
+            // comes from what the action does — a check that links a file is
+            // "Open", one that runs a command is "Run".
+            let row_do = row.get("do").cloned().filter(|v| !v.is_null());
+            let row_action_label = row_do.as_ref().map(check_action_label).unwrap_or("Open");
+            let row_action = self.action_handler(row_do.as_ref(), cx);
 
             let r = h_flex()
                 .id(SharedString::from(format!("{key}-check-{i}")))
@@ -1165,7 +1203,17 @@ impl MiniOrkPage {
                         .text_color(c(p::SUB))
                         .truncate()
                         .child(SharedString::from(detail)),
-                );
+                )
+                .when_some(row_action, |this, handler| {
+                    this.child(p::button(
+                        SharedString::from(format!("{key}-check-{i}-do")),
+                        row_action_label,
+                        "ghost",
+                        20.,
+                        11.5,
+                        Some(handler),
+                    ))
+                });
             col = col.child(r);
 
             if is_open && is_failing {
