@@ -469,15 +469,54 @@ impl MiniOrkPage {
                 v_flex().flex_none().w(rems_from_px(260_f32)).gap_2().child(header).child(body)
             }));
 
+        // The section's own title, note and actions. They were emitted and
+        // dropped — `kanban.py` passes a `note` nobody could read — and a board
+        // whose filter or bulk action is invisible is a board the reader has to
+        // guess at. Drawn as the generic card header the other sections use.
+        let title = str_of(s, "title");
+        let note = str_of(s, "note");
+        let actions = arr(s, "actions");
+
+        let mut content = v_flex().gap_2p5();
+        if !title.is_empty() || !actions.is_empty() {
+            content = content.child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .when(!title.is_empty(), |this| {
+                        this.child(self.texts.text(
+                            format!("s{index}-columns-title"),
+                            &title,
+                            Look::new(13., c(p::TEXT)).bold(true),
+                            cx,
+                        ))
+                    })
+                    .child(div().flex_1())
+                    .children(actions.iter().enumerate().map(|(i, b)| {
+                        self.button(SharedString::from(format!("s{index}-columns-a{i}")), b, 24., 12., cx)
+                    })),
+            );
+        }
+        if !note.is_empty() {
+            content = content.child(self.texts.text(
+                format!("s{index}-columns-note"),
+                &note,
+                Look::new(11.5, c(p::SUB)),
+                cx,
+            ));
+        }
+
         card()
             .flex_1()
             .min_w_0()
             .child(
-                div()
-                    .id(SharedString::from(format!("s{index}-columns-scroll")))
-                    .w_full()
-                    .overflow_x_scroll()
-                    .child(band),
+                content.child(
+                    div()
+                        .id(SharedString::from(format!("s{index}-columns-scroll")))
+                        .w_full()
+                        .overflow_x_scroll()
+                        .child(band),
+                ),
             )
             .into_any_element()
     }
@@ -583,6 +622,8 @@ impl MiniOrkPage {
     /// for the step's `do`, the rest of the header toggles expansion.
     pub(crate) fn render_story(&self, index: usize, s: &Value, cx: &mut Context<Self>) -> AnyElement {
         let steps = arr(s, "steps");
+        let section_title = str_of(s, "title");
+        let mono_font = p::mono_font(cx);
         let mut content = v_flex().gap_1p5();
         for (i, step) in steps.iter().enumerate() {
             let step_id = str_of(step, "id");
@@ -591,6 +632,9 @@ impl MiniOrkPage {
             let state = str_of(step, "state");
             let title = str_of(step, "title");
             let lane = str_of(step, "lane");
+            let kind = str_of(step, "kind");
+            let model = str_of(step, "model");
+            let meta_items = arr(step, "meta");
             let dur = str_of(step, "dur");
             let cost = str_of(step, "cost");
             let headline_obj = step.get("headline").cloned().unwrap_or(Value::Null);
@@ -641,6 +685,31 @@ impl MiniOrkPage {
                 ))
                 .child(p::lane_mark(&lane, 13.))
                 .child(title_el)
+                // The node's `kind` and the `model` that served it. Both have
+                // been on every step since the story shipped and were never
+                // drawn — the kind was inferable from the lane glyph and the
+                // model was not inferable at all.
+                .when(!kind.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .flex_none()
+                            .text_size(rems_from_px(10.5_f32))
+                            .text_color(c(p::DIM))
+                            .child(SharedString::from(kind.clone())),
+                    )
+                })
+                .when(!model.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .flex_none()
+                            .max_w(rems_from_px(150_f32))
+                            .truncate()
+                            .text_size(rems_from_px(10.5_f32))
+                            .font(mono_font.clone())
+                            .text_color(c(p::DIM))
+                            .child(SharedString::from(model.clone())),
+                    )
+                })
                 .when(!headline_t.is_empty(), |this| {
                     this.child(
                         div()
@@ -653,28 +722,46 @@ impl MiniOrkPage {
                     )
                 })
                 .child(div().flex_1())
-                .when(!dur.is_empty() || !cost.is_empty(), |this| {
-                    let mono = p::mono_font(cx);
-                    let mut meta = h_flex().flex_none().gap_2().items_baseline();
+                .when(!meta_items.is_empty() || !dur.is_empty() || !cost.is_empty(), |this| {
+                    let mut cluster = h_flex().flex_none().gap_2().items_baseline();
+                    // The engine's own per-step facts ("3 calls", "12,480
+                    // tokens"), `·`-joined so they read as one aside.
+                    if !meta_items.is_empty() {
+                        let joined = meta_items
+                            .iter()
+                            .map(|m| m.as_str().unwrap_or_default().to_string())
+                            .filter(|m| !m.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(" · ");
+                        if !joined.is_empty() {
+                            cluster = cluster.child(
+                                div()
+                                    .truncate()
+                                    .text_size(rems_from_px(11_f32))
+                                    .text_color(c(p::SUB))
+                                    .child(SharedString::from(joined)),
+                            );
+                        }
+                    }
                     if !dur.is_empty() {
-                        meta = meta.child(
+                        cluster = cluster.child(
                             div()
                                 .text_size(rems_from_px(11_f32))
                                 .text_color(c(p::SUB))
-                                .font(mono.clone())
+                                .font(mono_font.clone())
                                 .child(SharedString::from(dur.clone())),
                         );
                     }
                     if !cost.is_empty() {
-                        meta = meta.child(
+                        cluster = cluster.child(
                             div()
                                 .text_size(rems_from_px(11_f32))
                                 .text_color(c(p::SUB))
-                                .font(mono.clone())
+                                .font(mono_font.clone())
                                 .child(SharedString::from(cost.clone())),
                         );
                     }
-                    this.child(meta)
+                    this.child(cluster)
                 })
                 .child(
                     div()
@@ -688,9 +775,10 @@ impl MiniOrkPage {
             header = header.on_click(cx.listener(move |this, _, _, cx| {
                 this.toggle_step_expanded("story", &step_id_for_toggle, cx);
             }));
-            // A story has no card header of its own, so the section's floated
-            // copy button lands on the first row: pad the row clear of it.
-            if i == 0 {
+            // The section's floated copy button lands on whatever draws first.
+            // With a title it lands on the title (padded below); without one it
+            // lands on this, the first row.
+            if i == 0 && section_title.is_empty() {
                 header = header.pr(rems_from_px(24_f32));
             }
 
@@ -708,7 +796,26 @@ impl MiniOrkPage {
 
             content = content.child(row_el);
         }
-        content.into_any_element()
+        // The section's own title ("What happened"). `render_section` early-
+        // returns this section because it draws full-width rows, so the title
+        // it was given was never drawn by anything.
+        if section_title.is_empty() {
+            return content.into_any_element();
+        }
+        v_flex()
+            .gap_2p5()
+            .child(
+                div()
+                    .pr(rems_from_px(24_f32))
+                    .child(self.texts.text(
+                        format!("s{index}-story-title"),
+                        &section_title,
+                        Look::new(13., c(p::TEXT)).bold(true),
+                        cx,
+                    )),
+            )
+            .child(content)
+            .into_any_element()
     }
 
     /// The expanded body of a story step: each block by `kind`.
@@ -972,6 +1079,11 @@ impl MiniOrkPage {
             let abs = str_of(item, "abs");
             let issue = str_of(item, "issue");
             let snippet = str_of(item, "snippet");
+            // Which review field the finding came from — `findings`, `notes`
+            // or `reasons`. `notes` and `reasons` are the reviewer's asides, so
+            // a finding drawn from one is a weaker claim than one from
+            // `findings`, and the reader could not tell them apart.
+            let source = str_of(item, "source");
 
             let file_line_el = if !file_line.is_empty() {
                 let open_handler: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static>> =
@@ -1022,7 +1134,16 @@ impl MiniOrkPage {
                                 )
                             })
                             .child(file_line_el)
-                            .child(div().flex_1()),
+                            .child(div().flex_1())
+                            .when(!source.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(rems_from_px(10.5_f32))
+                                        .text_color(c(p::DIM))
+                                        .child(SharedString::from(source.clone())),
+                                )
+                            }),
                     )
                     .child(self.texts.text(
                         format!("{key}-find-{i}-issue"),
