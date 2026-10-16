@@ -71,8 +71,49 @@ pub fn init(cx: &mut App) {
     apply_ide_defaults(cx);
 }
 
+/// The mini-ork agent, ready in the Agent panel with no setup step.
+///
+/// This is the **simple tier**: an entry in the *default* settings layer, so
+/// it costs the user nothing and is never written to their `settings.json`. A
+/// real `agent_servers` entry there is the **secure tier** — same shape, their
+/// `command` and their `env` — and it wins, because defaults sit under user
+/// settings. One shape, two tiers, no call site changes between them.
+///
+/// Fails closed. `board::mini_ork_bin()` ends at a bare `"mini-ork"`, which
+/// would spawn whichever one `PATH` finds first; a machine that both runs and
+/// develops mini-ork has more than one, and the wrong one serves a different
+/// home silently. Registration is skipped unless the path is absolute and real.
+///
+/// No `env`: a pinned `MINI_ORK_HOME` would be a *single* home for every
+/// window, which breaks the moment two projects are open. The ACP protocol
+/// carries the session's cwd, and the agent resolves the project's `.mini-ork`
+/// from that — the same rule `board::resolve_home` uses.
+fn agent_server_defaults() -> Option<serde_json::Value> {
+    let bin = board::mini_ork_bin();
+    if !bin.is_absolute() || !bin.is_file() {
+        log::warn!(
+            "mini-ork IDE: no mini-ork launcher at {} — the agent is not registered",
+            bin.display()
+        );
+        return None;
+    }
+    Some(serde_json::json!({
+        "mini-ork": { "type": "custom", "command": bin, "args": ["acp"] }
+    }))
+}
+
 fn apply_ide_defaults(cx: &mut App) {
-    let overlay = match serde_json::from_str::<SettingsContent>(IDE_DEFAULTS) {
+    let mut overlay = match serde_json::from_str::<serde_json::Value>(IDE_DEFAULTS) {
+        Ok(overlay) => overlay,
+        Err(error) => {
+            log::error!("mini-ork IDE defaults: {error}");
+            return;
+        }
+    };
+    if let (Some(servers), Some(map)) = (agent_server_defaults(), overlay.as_object_mut()) {
+        map.insert("agent_servers".to_string(), servers);
+    }
+    let overlay = match serde_json::from_value::<SettingsContent>(overlay) {
         Ok(overlay) => overlay,
         Err(error) => {
             log::error!("mini-ork IDE defaults: {error}");
