@@ -624,9 +624,39 @@ impl MiniOrkPage {
             .into_any_element()
     }
 
+    /// A header text line with its field label leading it (`GOAL  …`). The
+    /// label is a fixed four-character mono column so GOAL and SPEC align and
+    /// the text after them starts on one edge.
+    fn header_field(&self, label: &str, body: AnyElement, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .items_start()
+            .gap(rems_from_px(7_f32))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(rems_from_px(10.5_f32))
+                    .font(p::mono_font(cx))
+                    .text_color(c(p::DIM))
+                    .child(label.to_string()),
+            )
+            .child(div().flex_1().min_w_0().child(body))
+            .into_any_element()
+    }
+
     fn render_header(&self, page: &Value, cx: &mut Context<Self>) -> AnyElement {
         let run_id = self.args.get("run").cloned().unwrap_or_default();
         let title = str_of(page, "title");
+        // A run page's payload may title the page with the run id itself, and
+        // the id is also drawn after the chips as the copyable handle. That
+        // printed it twice on one line. When they agree the title IS the
+        // handle: the copy button moves beside it and the second copy is not
+        // drawn at all.
+        let title_is_run = !run_id.is_empty() && title.trim() == run_id;
+        // A run page leads with the operator's goal and then a composed line
+        // (`recipe · title · worktree · branch`). Unlabelled, the two read as
+        // one paragraph that starts mid-sentence. Only run pages get the
+        // labels: a board or thread header's `desc` is not a goal.
+        let is_run_page = str_of(page, "key") == "run";
         let sub = str_of(page, "sub");
         let desc = str_of(page, "desc");
         let chips = arr(page, "chips");
@@ -647,6 +677,12 @@ impl MiniOrkPage {
                             .flex_wrap()
                             .items_center()
                             .child(self.texts.text("page-title", &title, Look::new(17., c(p::TEXT)).bold(true), cx))
+                            .when(title_is_run, |this| {
+                                this.child(
+                                    ui::CopyButton::new("run-copy", run_id.clone())
+                                        .tooltip_label("Copy run id"),
+                                )
+                            })
                             .children(chips.iter().map(|chip| {
                                 div()
                                     .px(rems_from_px(7_f32))
@@ -657,7 +693,7 @@ impl MiniOrkPage {
                                     .text_color(p::named(&str_of(chip, "c")))
                                     .child(str_of(chip, "t"))
                             }))
-                            .when(!run_id.is_empty(), |this| {
+                            .when(!run_id.is_empty() && !title_is_run, |this| {
                                 // Where this page is: the run id, in the same
                                 // mono the node tab's breadcrumb uses, with a
                                 // copy button beside it so the id is usable
@@ -680,9 +716,21 @@ impl MiniOrkPage {
                                 )
                             }),
                     )
-                    .when(!desc.is_empty(), |this| this.child(self.render_desc(&desc, cx)))
+                    .when(!desc.is_empty(), |this| {
+                        let body = self.render_desc(&desc, cx);
+                        this.child(if is_run_page {
+                            self.header_field("GOAL", body, cx)
+                        } else {
+                            body
+                        })
+                    })
                     .when(!sub.is_empty(), |this| {
-                        this.child(self.texts.text("page-sub", &sub, Look::new(12.5, c(p::SUB)), cx))
+                        let body = self.texts.text("page-sub", &sub, Look::new(12.5, c(p::SUB)), cx);
+                        this.child(if is_run_page {
+                            self.header_field("SPEC", body, cx)
+                        } else {
+                            body
+                        })
                     }),
             )
             .child(
