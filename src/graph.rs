@@ -1967,18 +1967,59 @@ impl MiniOrkGraph {
                             .child(node.label.clone()),
                     )
                     .child(p::text(state_text(&node.state).to_string(), 12., mc))
-                    // The run and node this panel is about, spelled out: beside
-                    // it the copy button copies something the panel names. In a
-                    // node tab the run id appears nowhere else — `render_header`
-                    // is not rendered there — so this is the only place to read
-                    // it.
-                    .child(
-                        p::text(copy_id.clone(), 11.5, p::MUTED)
-                            .font(p::mono_font(cx))
-                            .min_w_0()
-                            .truncate()
-                            .max_w(rems_from_px(220_f32)),
-                    )
+                    // Breadcrumb: the run this node belongs to, then the node.
+                    // The run id is the way back to the run's page — the same
+                    // destination as a click on empty canvas, the node tab's
+                    // only other exit. The copy button beside it copies the
+                    // path the breadcrumb spells out.
+                    .child({
+                        let mono = p::mono_font(cx);
+                        let workspace = self.workspace.clone();
+                        let page = self.page.clone();
+                        let run = self.model.run_id.clone();
+                        let title = self.model.title.clone();
+                        let tab_mode = self.tab_mode;
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                div()
+                                    .id("node-crumb-run")
+                                    .min_w_0()
+                                    .max_w(rems_from_px(170_f32))
+                                    .truncate()
+                                    .text_size(rems_from_px(11.5_f32))
+                                    .font(mono.clone())
+                                    .text_color(c(p::MUTED))
+                                    .cursor_pointer()
+                                    .hover(|s| s.text_color(c(p::TEXT)))
+                                    .child(run.clone())
+                                    .on_click(cx.listener(move |_this, _, window, cx| {
+                                        if tab_mode {
+                                            let Some(workspace) = workspace.upgrade() else {
+                                                return;
+                                            };
+                                            // The page knows which tab is its own; a node
+                                            // tab opened without it (from a Threads card)
+                                            // leaves the engine to resolve the default.
+                                            let tab = page.upgrade().map(|page| page.read(cx).main_tab());
+                                            crate::page::open_run(&workspace, run.clone(), title.clone(), tab, window, cx);
+                                        } else {
+                                            // The full-screen graph sits over the run page;
+                                            // dismissing it is what shows the page.
+                                            cx.emit(DismissEvent);
+                                        }
+                                    })),
+                            )
+                            .child(p::text("›", 11.5, p::DIM))
+                            .child(
+                                p::text(node.id.clone(), 11.5, p::SUB)
+                                    .font(mono)
+                                    .min_w_0()
+                                    .truncate()
+                                    .max_w(rems_from_px(160_f32)),
+                            )
+                    })
                     .child(ui::CopyButton::new("node-copy", copy_id.clone()).tooltip_label("Copy run and node id"))
                     .child(div().flex_1())
                     .child(icon_button("node-prev", "↑").on_click(cx.listener(|this, _, _, cx| this.step(-1, cx))))
