@@ -977,6 +977,7 @@ impl MiniOrkPage {
             "table" => return self.render_table(index, s, cx),
             "kv" => return self.render_kv(index, s, cx),
             "list" => return self.render_list(index, s, cx),
+            "feed" => return self.render_feed(index, s, cx),
             // A sheet preview reads like every other table.
             "document" if str_of(s, "kind") == "grid" => {
                 return self.render_table(index, &crate::documents::grid_table(s), cx);
@@ -1331,6 +1332,195 @@ impl MiniOrkPage {
                         )))
                     })
             }))
+            .into_any_element();
+        self.orca_section(index, s, Some(items.len()), cx, body)
+    }
+
+    /// A run-level activity feed: what the orchestrator did, newest first.
+    ///
+    /// The node Stream is a transcript you follow from the bottom; this page is
+    /// a status board, so the newest row leads and the list is bounded. The
+    /// status line and the filter chips are why this is a section of its own
+    /// rather than a `list`: a silent watcher has to read as "watching" with
+    /// zero rows, and "signals only" is the first thing a reader asks for.
+    fn render_feed(&self, index: usize, s: &Value, cx: &mut Context<Self>) -> AnyElement {
+        let mono = p::mono_font(cx);
+        let status = str_of(s, "status");
+        let meta = str_of(s, "meta");
+        let copy = str_of(s, "copy");
+        let empty = str_of(s, "empty");
+        let items = arr(s, "items");
+        let mut header = h_flex()
+            .gap(rems_from_px(7_f32))
+            .items_center()
+            .text_size(rems_from_px(11.5_f32))
+            .font(mono.clone());
+        if !status.is_empty() {
+            let status_colour = p::named(&str_of(s, "status_c"));
+            header = header
+                .child(
+                    div()
+                        .text_size(rems_from_px(11.5_f32))
+                        .text_color(status_colour)
+                        .child("●"),
+                )
+                .child(
+                    div()
+                        .text_size(rems_from_px(11.5_f32))
+                        .text_color(status_colour)
+                        .child(status.clone()),
+                );
+        }
+        if !meta.is_empty() {
+            header = header.child(p::text(meta.clone(), 11.5, p::DIM).truncate().min_w_0());
+        }
+        header = header.child(div().flex_1());
+        if !copy.is_empty() {
+            header = header.child(
+                ui::CopyButton::new(
+                    SharedString::from(format!("s{index}-feed-copy")),
+                    SharedString::from(copy),
+                )
+                .tooltip_label("Copy the activity log"),
+            );
+        }
+        let filters = h_flex()
+            .flex_wrap()
+            .gap_1p5()
+            .children(arr(s, "filters").iter().enumerate().map(|(i, item)| {
+                let on = bool_of(item, "on");
+                let handler = self.action_handler(item.get("do"), cx);
+                let chip = h_flex()
+                    .id(SharedString::from(format!("s{index}-feed-chip{i}")))
+                    .h_6()
+                    .px_2p5()
+                    .items_center()
+                    .border_1()
+                    .border_color(c(if on { p::DIM } else { p::BORDER2 }))
+                    .when(on, |this| this.bg(c(p::SELECTED)))
+                    .text_size(rems_from_px(12_f32))
+                    .text_color(c(if on { p::TEXT } else { p::MUTED }))
+                    .child(str_of(item, "t"));
+                match handler {
+                    Some(handler) => chip.cursor_pointer().on_click(handler).into_any_element(),
+                    None => chip.into_any_element(),
+                }
+            }));
+        let rows = v_flex()
+            .id(SharedString::from(format!("s{index}-feed")))
+            .max_h(rems_from_px(460_f32))
+            .overflow_y_scroll()
+            .gap(rems_from_px(2_f32))
+            .children(items.iter().enumerate().map(|(i, item)| {
+                let colour = str_of(item, "c");
+                let detail = str_of(item, "d");
+                let when = str_of(item, "when");
+                let acts = arr(item, "acts");
+                let handler = self.action_handler(item.get("do"), cx);
+                h_flex()
+                    .id(SharedString::from(format!("s{index}-feed-i{i}")))
+                    .items_start()
+                    .gap(rems_from_px(9_f32))
+                    .pl_2()
+                    .py_0p5()
+                    .border_l_2()
+                    .border_color(p::named(&colour))
+                    .when(handler.is_some(), |this| {
+                        this.cursor_pointer().hover(|s| s.bg(c(p::HOVER)))
+                    })
+                    .child(
+                        div()
+                            .flex_none()
+                            .w_3p5()
+                            .mt(px(1.))
+                            .text_size(rems_from_px(12_f32))
+                            .text_color(p::named(&colour))
+                            .child(str_of(item, "g")),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .items_baseline()
+                            .gap(rems_from_px(8_f32))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .min_w(rems_from_px(96_f32))
+                                    .font(mono.clone())
+                                    .text_size(rems_from_px(12.5_f32))
+                                    .text_color(p::named(&str_of(item, "tc")))
+                                    .child(str_of(item, "t")),
+                            )
+                            .when(!detail.is_empty(), |this| {
+                                this.child(
+                                    div().flex_1().min_w_0().truncate().child(self.texts.text(
+                                        format!("s{index}-feed-id{i}"),
+                                        &detail,
+                                        Look::new(11.5, c(p::SUB)).mono(true),
+                                        cx,
+                                    )),
+                                )
+                            }),
+                    )
+                    .when(!when.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .mt(px(2.))
+                                .font(mono.clone())
+                                .text_size(rems_from_px(11_f32))
+                                .text_color(c(p::SUB))
+                                .child(when),
+                        )
+                    })
+                    .when(!acts.is_empty(), |this| {
+                        this.child(h_flex().flex_none().gap(rems_from_px(5_f32)).children(
+                            acts.iter().enumerate().map(|(a, b)| {
+                                let handler = self.action_handler(b.get("do"), cx);
+                                let named_kind = str_of(b, "kind");
+                                let kind = if named_kind.is_empty() { "ghost" } else { &named_kind };
+                                p::button(
+                                    SharedString::from(format!("s{index}-feed-i{i}-a{a}")),
+                                    str_of(b, "label"),
+                                    kind,
+                                    22.,
+                                    11.5,
+                                    handler,
+                                )
+                            }),
+                        ))
+                    })
+                    .when_some(handler, |this, handler| this.on_click(handler))
+                    .into_any_element()
+            }));
+        let body = v_flex()
+            .gap_2()
+            .child(header)
+            .when(!arr(s, "filters").is_empty(), |this| this.child(filters))
+            .when(items.is_empty() && !empty.is_empty(), |this| {
+                this.child(self.texts.text(
+                    format!("s{index}-feed-empty"),
+                    &empty,
+                    Look::new(11.5, c(p::SUB)).mono(true),
+                    cx,
+                ))
+            })
+            .when(!items.is_empty(), |this| this.child(rows))
+            .when_some(s.get("more"), |this, more| {
+                let label = str_of(more, "t");
+                let handler = self.action_handler(more.get("do"), cx);
+                let line = h_flex()
+                    .id(SharedString::from(format!("s{index}-feed-more")))
+                    .py_1p5()
+                    .text_size(rems_from_px(11.5_f32))
+                    .text_color(c(p::BLUE))
+                    .child(label);
+                match handler {
+                    Some(handler) => this.child(line.cursor_pointer().hover(|s| s.underline()).on_click(handler)),
+                    None => this.child(line),
+                }
+            })
             .into_any_element();
         self.orca_section(index, s, Some(items.len()), cx, body)
     }
