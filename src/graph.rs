@@ -56,7 +56,7 @@ const EDGE_HIT: f32 = 5.;
 const STREAM_POLL: Duration = Duration::from_millis(1500);
 /// Height of the DAG strip at the top of a node tab — enough for a recipe's
 /// deepest column plus its head labels, without crowding the detail below.
-const NODE_TAB_DAG_H: f32 = 280.;
+pub(crate) const NODE_TAB_DAG_H: f32 = 280.;
 /// The node inspector, in reading order: what happened, the live work, the
 /// code it changed, what it was given and produced, then the raw material,
 /// and last the harness the node was wired to.

@@ -1784,10 +1784,12 @@ impl MiniOrkPage {
         // frame later, because building it needs a window.
         let body: AnyElement = match self.dag_graph.clone() {
             Some(graph) => {
-                // Tall enough for the strip plus a transcript, short enough
-                // that the run's own panels below it stay in reach.
-                let graph_height = (f32::from(window.viewport_size().height) - 320.).clamp(420., 720.);
-                div().w_full().min_w_0().h(px(graph_height)).child(graph).into_any_element()
+                // The run page's graph is the strip — a fixed-height canvas
+                // (`graph::NODE_TAB_DAG_H`). A taller box than that only adds
+                // an empty band under the DAG, so the wrapper takes the
+                // strip's own height and the card ends where the drawing does.
+                div().w_full().min_w_0().h(px(crate::graph::NODE_TAB_DAG_H))
+                    .child(graph).into_any_element()
             }
             None => scroller.into_any_element(),
         };
