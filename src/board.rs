@@ -130,6 +130,14 @@ impl Run {
     }
 }
 
+/// The page spec level the IDE asks mini-ork for. One constant for both read
+/// paths: the subprocess sets it in the child's environment, and the loopback
+/// read (`crate::ide_http`) both sets it on a server it starts and asks for it
+/// per request. Two literals would drift, and the two paths would then render
+/// different pages for the same run — which is exactly what happened while this
+/// was two literals and one of them was missing.
+pub const IDE_SPEC: &str = "2";
+
 /// The `mini-ork` launcher: `$MINI_ORK_BIN`, else the managed launcher
 /// `~/.local/bin/mini-ork` (written by `mini-ork install`; it pins mini-ork's
 /// own Python), else the first `mini-ork` on `PATH`. The managed one comes
@@ -191,7 +199,7 @@ async fn run_json(bin: &Path, args: &[String], home: &Path) -> Result<Value> {
         // An inherited flag would stop the launcher from switching to
         // mini-ork's own Python.
         .env_remove("MINI_ORK_VENV_ACTIVE")
-        .env("MINI_ORK_IDE_SPEC", "2");
+        .env("MINI_ORK_IDE_SPEC", IDE_SPEC);
     if let Some(project) = home.parent() {
         command.current_dir(project).env("PWD", project);
     }
@@ -348,7 +356,7 @@ pub async fn run_action(bin: PathBuf, home: PathBuf, args: Vec<String>, with_hom
     command
         .args(&args)
         .env("MINI_ORK_HOME", &home)
-        .env("MINI_ORK_IDE_SPEC", "2")
+        .env("MINI_ORK_IDE_SPEC", IDE_SPEC)
         .env_remove("MINI_ORK_VENV_ACTIVE");
     if with_home {
         command.arg("--home").arg(&home);

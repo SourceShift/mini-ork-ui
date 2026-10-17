@@ -30,6 +30,8 @@ use http_client::{AsyncBody, HttpClient, HttpRequestExt as _, Request, StatusCod
 use serde_json::Value;
 use util::command::Stdio;
 
+use crate::board::IDE_SPEC;
+
 /// The port `mini-ork serve` binds by default. Fixed rather than negotiated
 /// because a server the user already started by hand is worth reusing, and
 /// because a fixed port is what the first probe can look at.
@@ -128,6 +130,10 @@ async fn probe(home: &Path, path: &str, query: &[(&str, String)]) -> Probe {
     {
         let mut pairs = url.query_pairs_mut();
         pairs.append_pair("home", &home.display().to_string());
+        // The spec level travels per request, not only on a server we started:
+        // one already listening was started by something else — the user, an
+        // earlier session — and its own default is level 1, the retired page.
+        pairs.append_pair("spec", IDE_SPEC);
         for (name, value) in query {
             pairs.append_pair(name, value);
         }
@@ -170,6 +176,7 @@ fn start(bin: &Path, home: &Path) {
         ])
         .arg(home)
         .env("MINI_ORK_HOME", home)
+        .env("MINI_ORK_IDE_SPEC", IDE_SPEC)
         // Let the launcher re-exec into mini-ork's own Python; an inherited
         // flag would stop it.
         .env_remove("MINI_ORK_VENV_ACTIVE")

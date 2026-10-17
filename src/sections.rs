@@ -245,6 +245,7 @@ impl MiniOrkPage {
         let pill = s.get("pill").filter(|v| !v.is_null());
         let meta = arr(s, "meta");
         let criteria = arr(s, "criteria");
+        let cells = arr(s, "cells");
 
         let mut content = v_flex().gap_2p5();
 
@@ -317,6 +318,46 @@ impl MiniOrkPage {
                                 Look::new(12.5, c(p::BODY)),
                                 cx,
                             ))
+                    })),
+            );
+        }
+
+        if !cells.is_empty() {
+            // The design's stat strip: one large value over a quiet label, all
+            // cells sharing the row so the numbers line up. `flex_1` rather
+            // than a fixed width keeps a narrow pane from clipping the last
+            // cell — the row wraps instead.
+            content = content.child(
+                h_flex()
+                    .gap_5()
+                    .flex_wrap()
+                    .mt(px(2.))
+                    .children(cells.iter().enumerate().map(|(i, cell)| {
+                        let sub = str_of(cell, "sub");
+                        v_flex()
+                            .flex_1()
+                            .min_w(rems_from_px(96_f32))
+                            .gap(rems_from_px(1_f32))
+                            .child(self.texts.text(
+                                format!("s{index}-hero-cell{i}"),
+                                str_of(cell, "v"),
+                                Look::new(16., named(&str_of(cell, "c"))).mono(true),
+                                cx,
+                            ))
+                            .child(self.texts.text(
+                                format!("s{index}-hero-cell-l{i}"),
+                                str_of(cell, "label"),
+                                Look::new(11., c(p::SUB)),
+                                cx,
+                            ))
+                            .when(!sub.is_empty(), |this| {
+                                this.child(self.texts.text(
+                                    format!("s{index}-hero-cell-s{i}"),
+                                    &sub,
+                                    Look::new(11., named(&str_of(cell, "sc"))).mono(true),
+                                    cx,
+                                ))
+                            })
                     })),
             );
         }

@@ -657,6 +657,15 @@ impl MiniOrkPage {
         // one paragraph that starts mid-sentence. Only run pages get the
         // labels: a board or thread header's `desc` is not a goal.
         let is_run_page = str_of(page, "key") == "run";
+        // A page that titles itself with the run id already says what the two
+        // lines under it are (the design's `run.title`, then the facts in the
+        // Outcome tab); labelling them GOAL/SPEC there is noise. The default
+        // keeps every other run page exactly as it was.
+        let labelled = is_run_page
+            && page
+                .get("field_labels")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
         let sub = str_of(page, "sub");
         let desc = str_of(page, "desc");
         let chips = arr(page, "chips");
@@ -718,7 +727,7 @@ impl MiniOrkPage {
                     )
                     .when(!desc.is_empty(), |this| {
                         let body = self.render_desc(&desc, cx);
-                        this.child(if is_run_page {
+                        this.child(if labelled {
                             self.header_field("GOAL", body, cx)
                         } else {
                             body
@@ -726,7 +735,7 @@ impl MiniOrkPage {
                     })
                     .when(!sub.is_empty(), |this| {
                         let body = self.texts.text("page-sub", &sub, Look::new(12.5, c(p::SUB)), cx);
-                        this.child(if is_run_page {
+                        this.child(if labelled {
                             self.header_field("SPEC", body, cx)
                         } else {
                             body
@@ -1161,6 +1170,50 @@ impl MiniOrkPage {
 
     fn render_kv(&self, index: usize, s: &Value, cx: &mut Context<Self>) -> AnyElement {
         let items = arr(s, "items");
+        // The design's data-grid kv: `cols` turns the vertical key/value list
+        // into a grid of label-over-value cells (the run's facts and the
+        // selected node's facts). Without `cols` the long-standing list stays
+        // — some payloads read better as one key per line.
+        let cols = s.get("cols").and_then(Value::as_u64).unwrap_or(0) as usize;
+        if cols > 0 && !items.is_empty() {
+            let big = bool_of(s, "big");
+            let body = v_flex()
+                .children(items.chunks(cols).enumerate().map(|(row, cells)| {
+                    h_flex()
+                        .items_start()
+                        .gap_5()
+                        .children(cells.iter().enumerate().map(|(i, item)| {
+                            let sub = str_of(item, "sub");
+                            v_flex()
+                                .flex_1()
+                                .min_w(rems_from_px(88_f32))
+                                .gap(rems_from_px(1_f32))
+                                .child(
+                                    div()
+                                        .text_size(rems_from_px(10_f32))
+                                        .text_color(c(p::SUB))
+                                        .child(SharedString::from(str_of(item, "k").to_uppercase())),
+                                )
+                                .child(self.texts.text(
+                                    format!("s{index}-g{row}-{i}"),
+                                    str_of(item, "v"),
+                                    Look::new(if big { 16. } else { 13. }, p::named(&str_of(item, "c")))
+                                        .mono(true),
+                                    cx,
+                                ))
+                                .when(!sub.is_empty(), |this| {
+                                    this.child(self.texts.text(
+                                        format!("s{index}-gs{row}-{i}"),
+                                        &sub,
+                                        Look::new(11., c(p::SUB)).mono(true),
+                                        cx,
+                                    ))
+                                })
+                        }))
+                }))
+                .into_any_element();
+            return self.orca_section(index, s, None, cx, body);
+        }
         let body = v_flex()
             .gap_1p5()
             .children(items.iter().enumerate().map(|(i, item)| {
@@ -1299,6 +1352,7 @@ impl MiniOrkPage {
         body: AnyElement,
     ) -> AnyElement {
         let title = str_of(s, "title");
+        let sub = str_of(s, "sub");
         let note = str_of(s, "note");
         let actions = arr(s, "actions");
         components::card()
@@ -1312,7 +1366,22 @@ impl MiniOrkPage {
                     .items_center()
                     // Clear of the copy button floated into the card's corner.
                     .pr(rems_from_px(24_f32))
-                    .child(div().flex_1().min_w(rems_from_px(120_f32)).child(components::section_head(&title, count)))
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w(rems_from_px(120_f32))
+                            .gap_2()
+                            .items_center()
+                            .child(components::section_head(&title, count))
+                            .when(!sub.is_empty(), |this| {
+                                this.child(self.texts.text(
+                                    format!("s{index}-sub"),
+                                    &sub,
+                                    Look::new(11., c(p::SUB)),
+                                    cx,
+                                ))
+                            }),
+                    )
                     .children(actions.iter().enumerate().map(|(i, b)| {
                         self.button(SharedString::from(format!("s{index}-a{i}")), b, 24., 12., cx)
                     })),
@@ -1442,6 +1511,11 @@ impl MiniOrkPage {
 
     fn render_dag(&self, index: usize, s: &Value, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let mono = p::mono_font(cx);
+        // `select` means this DAG is the run page's own DAG tab: a click picks
+        // the node *in place*, so the detail below the graph follows the click
+        // the way the design shows. Every other DAG (the node tab's canvas,
+        // the strip) keeps the click-to-open behaviour.
+        let select_mode = bool_of(s, "select");
         // The canvas a node tab leads with, drawn here from the same model, so
         // the run page's DAG and the DAG tab's DAG cannot drift into two
         // pictures of one run. The payload is already in memory (`self.data`),
@@ -1532,7 +1606,11 @@ impl MiniOrkPage {
                     el.cursor_pointer()
                         .hover(|s| s.border_color(c(p::BLUE)))
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open_node_tab(node_id.clone(), window, cx)
+                            if select_mode {
+                                this.select_node(node_id.clone(), cx);
+                            } else {
+                                this.open_node_tab(node_id.clone(), window, cx);
+                            }
                         }))
                         .into_any_element()
                 })));
@@ -1572,7 +1650,14 @@ impl MiniOrkPage {
                 // travels with it so the inspector's retry/gate/merge steps can
                 // act through `Origin::Page` rather than going nowhere.
                 let on_node = std::rc::Rc::new(move |node: &str, window: &mut Window, cx: &mut App| {
-                    page.update(cx, |this, cx| this.open_node_tab(node.to_string(), window, cx)).ok();
+                    page.update(cx, |this, cx| {
+                        if select_mode {
+                            this.select_node(node.to_string(), cx);
+                        } else {
+                            this.open_node_tab(node.to_string(), window, cx);
+                        }
+                    })
+                    .ok();
                 });
                 // Picking an edge here is the canvas' own reading aid, so it
                 // only re-draws the DAG: it opens nothing.
@@ -1692,11 +1777,11 @@ impl MiniOrkPage {
                     cx,
                 ),
         };
-        // Once the run graph exists it leads: the same strip a node tab shows,
-        // with the clicked node's inspector under it, so the page can be read
-        // and acted on without opening a second tab. The canvas above is the
-        // first frame's stand-in — the graph is built a frame later, because
-        // building it needs a window.
+        // Once the run graph exists it leads: the same canvas a node tab shows,
+        // with the selected node's detail below it (the engine's own sections),
+        // so the page can be read and acted on without opening a second tab.
+        // The canvas above is the first frame's stand-in — the graph is built a
+        // frame later, because building it needs a window.
         let body: AnyElement = match self.dag_graph.clone() {
             Some(graph) => {
                 // Tall enough for the strip plus a transcript, short enough
@@ -1979,6 +2064,15 @@ impl MiniOrkPage {
         }
     }
 
+    /// Pick a node *within* this page: the DAG tab's detail below the graph
+    /// is the engine's render of `args.node`, so the click is a re-fetch with
+    /// one argument merged. The node tab stays one button away (`Open node`).
+    pub(crate) fn select_node(&mut self, node: String, cx: &mut Context<Self>) {
+        let mut args = BTreeMap::new();
+        args.insert("node".to_string(), node);
+        self.set_args(args, cx);
+    }
+
     /// Zoom the flow map to `zoom`, keeping the point under the pointer where
     /// it is. `before` is the zoom the pointer's position was measured at.
     pub(crate) fn zoom_flow_from(
@@ -2088,13 +2182,19 @@ impl MiniOrkPage {
         // keeps whatever is selected, so a live run does not yank the reader
         // off the node they are looking at every time the board moves.
         let focus = model.last_ran().map(|node| node.id.clone());
+        // The run page renders the graph inside its DAG tab with the node's
+        // detail below it; no other run-keyed page does.
+        let select_page = self.key == "run";
         let (workspace, page_handle) = (self.workspace.clone(), cx.entity().downgrade());
         let graph = cx.new(|cx| {
             let mut graph = crate::graph::MiniOrkGraph::new(model, focus, workspace, page_handle, window, cx);
             graph.tab_mode = true;
-            // The run page carries the strip and its own chrome below it, so
-            // the graph draws no inspector: a node opens in its own tab.
+            // The run page carries its own chrome: the DAG tab's node detail
+            // below the graph and the rest of the page's sections. The graph
+            // draws no inspector of its own, and a click selects in place so
+            // that detail follows it.
             graph.strip_only = true;
+            graph.select_page = select_page;
             graph
         });
         // The pills row rides with the node Overview, and the graph's own
@@ -2306,7 +2406,13 @@ impl Render for MiniOrkPage {
                 // the flow map sits behind the Steps · Flow map toggle. With
                 // Flow map chosen the map leads and the DAG section below it
                 // is retired, since the map carries its own full-screen button.
-                let on_graph = str_of(&page, "tab") == "graph";
+                // The tab that carries the step graph is `graph` at level 2's
+                // older naming and `dag` in the redesign; the flow map is the
+                // same feature on either, so both offer the toggle. Only when
+                // the payload actually carries a flow map — the toggle over
+                // nothing is a dead control.
+                let on_graph = matches!(str_of(&page, "tab").as_str(), "graph" | "dag")
+                    && page.get("flow").is_some_and(|f| f.is_object());
                 let show_flow = on_graph && self.show_flow_map;
                 let flow_map = show_flow
                     .then(|| page.get("flow"))
@@ -2319,7 +2425,14 @@ impl Render for MiniOrkPage {
                 // built a frame late (it needs a window), so on the first frame
                 // the section's stand-in canvas draws instead and `hide_dag`
                 // stays false — the strip takes over on the next.
-                let strip_live = !self.dock && self.args.contains_key("run") && self.dag_graph.is_some() && !show_flow;
+                // The run page draws its DAG inside the DAG tab (the redesign's
+                // order), so the persistent strip above the header is retired
+                // there; the strip still leads every other run-keyed page.
+                let strip_live = !self.dock
+                    && self.key != "run"
+                    && self.args.contains_key("run")
+                    && self.dag_graph.is_some()
+                    && !show_flow;
                 let strip = strip_live.then(|| self.render_strip(cx));
                 // Retire the section once the strip owns the canvas, so the DAG
                 // is drawn once rather than twice.

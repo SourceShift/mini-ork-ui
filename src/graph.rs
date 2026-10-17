@@ -784,6 +784,11 @@ pub struct MiniOrkGraph {
     /// filling an in-place panel. This is what keeps a run page and a node tab
     /// one strip and one tab bar rather than two of each.
     pub strip_only: bool,
+    /// A run page whose DAG tab carries its own node detail below the graph:
+    /// a click selects the node *in place* (the page re-fetches with
+    /// `args.node`) instead of opening the node's own tab. The detail still
+    /// stays one button away, on the section's `Open node` action.
+    pub select_page: bool,
     /// The node tab's DAG strip has fit its zoom to the strip's width once
     /// (re-armed by `set_model`), so the whole graph — including the
     /// rightmost node — is visible without scrolling.
@@ -877,6 +882,7 @@ impl MiniOrkGraph {
             texts: Texts::default(),
             tab_mode: false,
             strip_only: false,
+            select_page: false,
             tab_fit: false,
             stream_full: false,
             maximized: false,
@@ -1326,14 +1332,23 @@ impl MiniOrkGraph {
             let this = this.clone();
             let page = self.page.clone();
             let strip_only = self.strip_only;
+            let select_page = self.select_page;
             move |node: &str, window: &mut Window, cx: &mut App| {
                 // A run page's strip carries no inspector, so a click has to
-                // land somewhere: it opens the node's own tab, the same detail
-                // the page's own canvas and a Threads card give. A node tab
-                // keeps its in-place inspector, and selects there instead.
+                // land somewhere: the DAG tab keeps its node detail below the
+                // graph, so it selects in place; anywhere else it opens the
+                // node's own tab, the same detail the page's own canvas and a
+                // Threads card give. A node tab keeps its in-place inspector,
+                // and selects there instead.
                 if strip_only {
                     if let Some(page) = page.upgrade() {
-                        page.update(cx, |page, cx| page.open_node_tab(node.to_string(), window, cx));
+                        if select_page {
+                            page.update(cx, |page, cx| page.select_node(node.to_string(), cx));
+                        } else {
+                            page.update(cx, |page, cx| {
+                                page.open_node_tab(node.to_string(), window, cx)
+                            });
+                        }
                     }
                     return;
                 }
