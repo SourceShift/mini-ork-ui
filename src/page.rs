@@ -737,6 +737,19 @@ impl MiniOrkPage {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let sections = arr(page, "sections");
+        // The tab this payload belongs to, prefixed onto every section id: a
+        // bare `s0-table` names the first table of EVERY tab, so a copied
+        // element reference could not say which page it came from. The payload
+        // wins (a cached tab renders its own), then the viewed tab, then a
+        // stand-in for payloads that carry no tab key at all.
+        let tab = {
+            let payload_tab = str_of(page, "tab");
+            if payload_tab.is_empty() {
+                self.tab.clone().unwrap_or_else(|| "page".to_string())
+            } else {
+                payload_tab
+            }
+        };
         let mut rows: Vec<AnyElement> = Vec::new();
         let mut group: Vec<(usize, &Value)> = Vec::new();
         // The run-level pills row rides with the node Overview, so it is read
@@ -760,10 +773,10 @@ impl MiniOrkPage {
                         .items_start()
                         .gap_3()
                         .child(v_flex().flex_1().min_w_0().gap_3().children(
-                            left.iter().map(|(i, s)| this.render_section_card(*i, s, window, cx)),
+                            left.iter().map(|(i, s)| this.render_section_card(&tab, *i, s, window, cx)),
                         ))
                         .child(v_flex().flex_1().min_w_0().gap_3().children(
-                            right.iter().map(|(i, s)| this.render_section_card(*i, s, window, cx)),
+                            right.iter().map(|(i, s)| this.render_section_card(&tab, *i, s, window, cx)),
                         ))
                         .into_any_element(),
                 );
@@ -771,7 +784,7 @@ impl MiniOrkPage {
                 for pair in group.chunks(2) {
                     let mut row = h_flex().gap_3();
                     for (i, s) in pair {
-                        row = row.child(div().flex_1().min_w_0().flex().child(this.render_section_card(*i, s, window, cx)));
+                        row = row.child(div().flex_1().min_w_0().flex().child(this.render_section_card(&tab, *i, s, window, cx)));
                     }
                     if pair.len() == 1 {
                         row = row.child(div().flex_1().min_w_0());
@@ -823,7 +836,7 @@ impl MiniOrkPage {
                 // clear (a hero's pill right-aligns into it).
                 rows.push(
                     div()
-                        .id(Self::section_id(i, s))
+                        .id(Self::section_id(&tab, i, s))
                         .w_full()
                         .min_w_0()
                         .child(self.render_section(i, s, window, cx))
@@ -837,20 +850,31 @@ impl MiniOrkPage {
         v_flex().gap_3().children(rows).into_any_element()
     }
 
-    /// The element id that names a section's payload (`s3-dag`), shared by the
-    /// carded and full-width paths so the two can never disagree.
-    fn section_id(index: usize, s: &Value) -> SharedString {
-        SharedString::from(format!("s{index}-{}", str_of(s, "type")))
+    /// The element id that names a section's payload (`artifacts:s0-table`),
+    /// shared by the carded and full-width paths so the two can never
+    /// disagree. The tab prefix is what makes a copied reference say which
+    /// page it came from: `s0-table` alone names the first table of every tab.
+    /// Only index and type are encoded — both stable for a given payload —
+    /// never the title, which is data and changes with it.
+    fn section_id(tab: &str, index: usize, s: &Value) -> SharedString {
+        SharedString::from(format!("{tab}:s{index}-{}", str_of(s, "type")))
     }
 
     /// A section's card, wrapped in an element whose id names the payload
-    /// section (`s3-dag`). The inspector's element reference reads
+    /// section (`artifacts:s0-table`). The inspector's element reference reads
     /// `<source location> · <id path of the nearest ancestor with an id>`, so
     /// without an id here every section of a page would resolve to the page
     /// element itself and a copied reference could not say which one was meant.
-    fn render_section_card(&self, index: usize, s: &Value, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_section_card(
+        &self,
+        tab: &str,
+        index: usize,
+        s: &Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         div()
-            .id(Self::section_id(index, s))
+            .id(Self::section_id(tab, index, s))
             .w_full()
             .min_w_0()
             .relative()
@@ -1212,6 +1236,12 @@ impl MiniOrkPage {
     /// The Orca card the restyled `table` / `kv` / `list` sections share:
     /// `components::card()`, headed by a `components::section_head` carrying
     /// the section's own actions, the note under the head, then the body.
+    ///
+    /// `#[track_caller]` so the cards it builds (and their heads) are
+    /// attributed to the section renderer that called it — the source half of
+    /// an inspector reference then names `render_table` and its line, instead
+    /// of this wrapper.
+    #[track_caller]
     fn orca_section(
         &self,
         index: usize,

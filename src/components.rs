@@ -42,6 +42,12 @@ impl<T: gpui::AnimationExt + ui::Transformable + Sized> ThrottledSpinExt for T {
 
 /// An Orca card: 1px border, CARD background, 12px inset. Square corners, like
 /// Zed's own boxes — the radius is what made these read as foreign.
+///
+/// `#[track_caller]` so the inspector attributes the card to the renderer that
+/// asked for it, not to this shared helper: the source half of a copied
+/// element reference is otherwise the same `components.rs` line for every card
+/// in the app.
+#[track_caller]
 pub fn card() -> Div {
     div().bg(c(p::CARD)).border_1().border_color(c(p::BORDER)).p_3()
 }
@@ -78,7 +84,9 @@ pub fn status_mark(state: &str, size: f32, key: &str) -> AnyElement {
 }
 
 /// A section heading: the title in 11px semibold MUTED, with a count pill
-/// (rendered by `state_pill` so it matches the rest of the design).
+/// (rendered by `state_pill` so it matches the rest of the design). Marked
+/// `#[track_caller]` for the same reason as [`card`].
+#[track_caller]
 pub fn section_head(title: &str, count: Option<usize>) -> Div {
     h_flex()
         .flex_none()
