@@ -1413,6 +1413,184 @@ impl MiniOrkPage {
         self.render_checks_body_inner(&format!("s{index}-checks"), s, cx)
     }
 
+    /// `levels` section: the verification vector, rendered from data.
+    ///
+    /// The engine ships each level's value, whether the run's task class
+    /// required it, and the reason it abstained; none of the presentation is
+    /// decided there. The one decision this renderer makes is the one the
+    /// verdict row cannot: a level the run could not fail is dimmed rather
+    /// than coloured, so a recipe without an instrument for it does not read
+    /// as a wall of failures beside a published verdict.
+    pub(crate) fn render_levels(&self, index: usize, s: &Value, cx: &mut Context<Self>) -> AnyElement {
+        let key = format!("s{index}-levels");
+        let rows = arr(s, "rows");
+        let decision = str_of(s, "decision");
+        let task_class = str_of(s, "task_class");
+        let mono = p::mono_font(cx);
+
+        let mut col = v_flex().gap_1p5();
+
+        let (decision_text, decision_colour) = match decision.as_str() {
+            "publish" => ("✓ Published", p::c(p::GREEN)),
+            "abstain" => ("● Not published — verification abstained", p::c(p::YELLOW)),
+            "refute" => ("✗ Verification refused the change", p::c(p::RED)),
+            _ => ("• No decision recorded", p::c(p::MUTED)),
+        };
+        col = col.child(
+            div()
+                .px_2()
+                .text_size(rems_from_px(12.5_f32))
+                .text_color(decision_colour)
+                .child(SharedString::from(decision_text)),
+        );
+
+        let mut required: Vec<String> = Vec::new();
+        let mut recorded = true;
+        let mut proven = 0usize;
+        let mut refuted = 0usize;
+        let mut unverified = 0usize;
+        let mut na = 0usize;
+        for row in &rows {
+            if row.get("required").map(Value::is_null).unwrap_or(true) {
+                recorded = false;
+            } else if row.get("required").and_then(Value::as_bool).unwrap_or(false) {
+                required.push(str_of(row, "name"));
+            }
+            match str_of(row, "value").as_str() {
+                "PROVEN" => proven += 1,
+                "REFUTED" => refuted += 1,
+                "UNVERIFIED" => unverified += 1,
+                _ => na += 1,
+            }
+        }
+        let requirement_line = if !recorded {
+            "Task class requirements not recorded.".to_string()
+        } else if required.is_empty() {
+            "No level is required for this run.".to_string()
+        } else {
+            let scope = if task_class.is_empty() {
+                "Required".to_string()
+            } else {
+                format!("Required for {task_class}")
+            };
+            format!("{scope}: {}.", required.join(", "))
+        };
+        col = col.child(
+            div()
+                .px_2()
+                .text_size(rems_from_px(11.5_f32))
+                .text_color(c(p::MUTED))
+                .child(SharedString::from(requirement_line)),
+        );
+
+        let mut summary = h_flex().gap_3p5().items_center().px_2().py_1();
+        summary = summary
+            .child(
+                div()
+                    .text_size(rems_from_px(12_f32))
+                    .text_color(c(p::GREEN))
+                    .child(SharedString::from(format!("✓ {proven} proven"))),
+            )
+            .child(
+                div()
+                    .text_size(rems_from_px(12_f32))
+                    .text_color(c(p::RED))
+                    .child(SharedString::from(format!("✗ {refuted} refuted"))),
+            )
+            .child(
+                div()
+                    .text_size(rems_from_px(12_f32))
+                    .text_color(c(p::YELLOW))
+                    .child(SharedString::from(format!("● {unverified} unverified"))),
+            );
+        if na > 0 {
+            summary = summary.child(
+                div()
+                    .text_size(rems_from_px(12_f32))
+                    .text_color(c(p::SUB))
+                    .child(SharedString::from(format!("○ {na} n/a"))),
+            );
+        }
+        col = col.child(summary);
+
+        for (i, row) in rows.iter().enumerate() {
+            let name = str_of(row, "name");
+            let value = str_of(row, "value");
+            let reason = str_of(row, "reason");
+            let required = row.get("required").and_then(Value::as_bool);
+            // A level that could not fail the run is a fact, not a failure:
+            // dim it, keep the glyph honest. An abstention on a required level
+            // is the only one that earns the warning colour.
+            let (glyph, colour) = match value.as_str() {
+                "PROVEN" => ("✓", p::c(p::GREEN)),
+                "REFUTED" => ("✗", p::c(p::RED)),
+                "UNVERIFIED" if required == Some(true) => ("●", p::c(p::YELLOW)),
+                "UNVERIFIED" => ("●", p::c(p::MUTED)),
+                _ => ("○", p::c(p::SUB)),
+            };
+            let requirement = match required {
+                Some(true) => "required",
+                Some(false) => "not required",
+                None => "not recorded",
+            };
+            col = col.child(
+                h_flex()
+                    .id(SharedString::from(format!("{key}-row-{i}")))
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py(rems_from_px(4_f32))
+                    .border_b_1()
+                    .border_color(c(p::ROW_RULE))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(rems_from_px(14_f32))
+                            .text_size(rems_from_px(12.5_f32))
+                            .text_color(colour)
+                            .child(SharedString::from(glyph)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(rems_from_px(84_f32))
+                            .text_size(rems_from_px(12.5_f32))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(c(p::TEXT))
+                            .child(SharedString::from(name)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(rems_from_px(11.5_f32))
+                            .font(mono.clone())
+                            .text_color(colour)
+                            .child(SharedString::from(value)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(rems_from_px(10.5_f32))
+                            .text_color(c(p::SUB))
+                            .child(SharedString::from(requirement)),
+                    )
+                    .when(!reason.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_size(rems_from_px(11_f32))
+                                .text_color(c(p::MUTED))
+                                .child(SharedString::from(reason)),
+                        )
+                    }),
+            );
+        }
+
+        col.into_any_element()
+    }
+
     /// `agents` section: rows of agent data without the normal card header.
     /// Orca's three-line rows: status + lane + id + model + cost + dur on line
     /// 1; step on line 2; last on line 3. Each row is clickable via its `do`.

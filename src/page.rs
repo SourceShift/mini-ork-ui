@@ -1003,6 +1003,7 @@ impl MiniOrkPage {
             "files" => self.render_files(index, s, cx),
             "findings" => self.render_findings(index, s, cx),
             "checks" => self.render_checks(index, s, cx),
+            "levels" => self.render_levels(index, s, cx),
             "agents" => self.render_agents(index, s, cx),
             "document" => self.render_document_body(index, s, cx),
             // Full document, capped in height and scrolled inside.
