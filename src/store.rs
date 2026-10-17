@@ -545,6 +545,8 @@ pub fn perform(
         cx.reveal_path(&PathBuf::from(path));
     } else if let Some(url) = action.get("url").and_then(Value::as_str) {
         cx.open_url(url);
+    } else if let Some(spec) = action.get("terminal") {
+        open_terminal(spec, workspace, window, cx);
     } else if let Some(text) = action.get("thread").and_then(Value::as_str) {
         new_thread(workspace, text, window, cx);
     } else if let Some(root) = action.get("project").and_then(Value::as_str) {
@@ -560,6 +562,79 @@ pub fn perform(
         let Origin::Page(page) = origin;
         page.update(cx, |page, cx| page.reload(cx)).log_err();
     }
+}
+
+/// `{"terminal": {"cli": [...], "cwd": p, "home": b}}`: hand a job to a real
+/// terminal.
+///
+/// A `cli` action runs with no TTY, so any command that must ask for input —
+/// `pm add` typing a credential at a hidden prompt — cannot be one. With
+/// `cli`, the terminal runs that command and stays open (`HideStrategy::Never`)
+/// so a failure is readable; without it, a plain shell opens at `cwd` (the
+/// project root next to `.mini-ork` by default). The page still never carries
+/// a secret: it hands over the *command*, and the person types the value.
+fn open_terminal(spec: &Value, workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App) {
+    let args: Vec<String> = spec
+        .get("cli")
+        .and_then(Value::as_array)
+        .map(|args| args.iter().filter_map(|a| a.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let store = BoardStore::for_workspace(workspace, cx);
+    let home = store.as_ref().and_then(|store| store.read(cx).home.clone());
+    let cwd = spec
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().and_then(|home| home.parent().map(Path::to_path_buf)));
+
+    if args.is_empty() {
+        workspace.update(cx, |workspace, cx| {
+            terminal_view::terminal_panel::TerminalPanel::add_center_terminal(
+                workspace,
+                window,
+                cx,
+                move |project, cx| project.create_terminal_shell(cwd.clone(), cx),
+            )
+            .detach_and_log_err(cx);
+        });
+        return;
+    }
+
+    let with_home = spec.get("home").and_then(Value::as_bool).unwrap_or(true);
+    let bin = store
+        .as_ref()
+        .map(|store| store.read(cx).bin.clone())
+        .unwrap_or_else(board::mini_ork_bin);
+    let mut argv = args;
+    let mut env: Vec<(String, String)> = Vec::new();
+    if let Some(home) = home.filter(|_| with_home) {
+        env.push((
+            "MINI_ORK_HOME".to_string(),
+            home.to_string_lossy().into_owned(),
+        ));
+        argv.push("--home".to_string());
+        argv.push(home.to_string_lossy().into_owned());
+    }
+    env.push(("MINI_ORK_IDE_SPEC".to_string(), board::IDE_SPEC.to_string()));
+    let label = format!("mini-ork {}", argv.join(" "));
+    let spawn = task::SpawnInTerminal {
+        id: task::TaskId("mini-ork-page".to_string()),
+        full_label: label.clone(),
+        label,
+        command: Some(bin.to_string_lossy().into_owned()),
+        command_label: argv.join(" "),
+        args: argv,
+        cwd,
+        env: env.into_iter().collect(),
+        use_new_terminal: true,
+        allow_concurrent_runs: true,
+        reveal: task::RevealStrategy::Always,
+        hide: task::HideStrategy::Never,
+        ..Default::default()
+    };
+    workspace
+        .update(cx, |workspace, cx| workspace.spawn_in_terminal(spawn, window, cx))
+        .detach();
 }
 
 fn string_map(value: Option<&Value>) -> BTreeMap<String, String> {
