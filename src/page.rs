@@ -977,7 +977,7 @@ impl MiniOrkPage {
             "table" => return self.render_table(index, s, cx),
             "kv" => return self.render_kv(index, s, cx),
             "list" => return self.render_list(index, s, cx),
-            "feed" => return self.render_feed(index, s, cx),
+            "feed" => return self.render_feed(index, s, window, cx),
             // A sheet preview reads like every other table.
             "document" if str_of(s, "kind") == "grid" => {
                 return self.render_table(index, &crate::documents::grid_table(s), cx);
@@ -1343,7 +1343,10 @@ impl MiniOrkPage {
     /// status line and the filter chips are why this is a section of its own
     /// rather than a `list`: a silent watcher has to read as "watching" with
     /// zero rows, and "signals only" is the first thing a reader asks for.
-    fn render_feed(&self, index: usize, s: &Value, cx: &mut Context<Self>) -> AnyElement {
+    fn render_feed(&self, index: usize, s: &Value, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if bool_of(s, "stream") {
+            return self.render_feed_stream(index, s, window, cx);
+        }
         let mono = p::mono_font(cx);
         let status = str_of(s, "status");
         let meta = str_of(s, "meta");
@@ -1523,6 +1526,317 @@ impl MiniOrkPage {
             })
             .into_any_element();
         self.orca_section(index, s, Some(items.len()), cx, body)
+    }
+
+    /// The feed in its **stream layout**: one panel with the node Stream's
+    /// grammar — a status line, filter chips, a scrollable transcript — and the
+    /// steering composer docked at the bottom instead of a card of its own.
+    ///
+    /// The carded `render_feed` is a status board for a page that already has
+    /// the reader's attention; this is the run's supervisor surface, where the
+    /// reader sits and watches. It reads the same payload keys as `render_feed`
+    /// plus `footer` (`{placeholder, cli, note, home}`), which `ensure_composers`
+    /// registers an editor for.
+    fn render_feed_stream(&self, index: usize, s: &Value, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let mono = p::mono_font(cx);
+        let status = str_of(s, "status");
+        let meta = str_of(s, "meta");
+        let copy = str_of(s, "copy");
+        let empty = str_of(s, "empty");
+        let items = arr(s, "items");
+
+        let mut header = h_flex()
+            .gap(rems_from_px(7_f32))
+            .items_center()
+            .text_size(rems_from_px(11.5_f32))
+            .font(mono.clone());
+        if !status.is_empty() {
+            let status_colour = p::named(&str_of(s, "status_c"));
+            header = header
+                .child(
+                    div()
+                        .text_size(rems_from_px(11.5_f32))
+                        .text_color(status_colour)
+                        .child("●"),
+                )
+                .child(
+                    div()
+                        .text_size(rems_from_px(11.5_f32))
+                        .text_color(status_colour)
+                        .child(status.clone()),
+                );
+        }
+        if !meta.is_empty() {
+            header = header.child(p::text(meta.clone(), 11.5, p::DIM).truncate().min_w_0());
+        }
+        header = header.child(div().flex_1());
+        if !copy.is_empty() {
+            header = header.child(
+                ui::CopyButton::new(
+                    SharedString::from(format!("s{index}-feed-copy")),
+                    SharedString::from(copy),
+                )
+                .tooltip_label("Copy the activity log"),
+            );
+        }
+        let header = v_flex().px_3p5().pt_2p5().pb_1p5().child(header);
+
+        let filters = h_flex()
+            .flex_wrap()
+            .gap_1p5()
+            .children(arr(s, "filters").iter().enumerate().map(|(i, item)| {
+                let on = bool_of(item, "on");
+                let handler = self.action_handler(item.get("do"), cx);
+                let chip = h_flex()
+                    .id(SharedString::from(format!("s{index}-feed-chip{i}")))
+                    .h_6()
+                    .px_2p5()
+                    .items_center()
+                    .border_1()
+                    .border_color(c(if on { p::DIM } else { p::BORDER2 }))
+                    .when(on, |this| this.bg(c(p::SELECTED)))
+                    .text_size(rems_from_px(12_f32))
+                    .text_color(c(if on { p::TEXT } else { p::MUTED }))
+                    .child(str_of(item, "t"));
+                match handler {
+                    Some(handler) => chip.cursor_pointer().on_click(handler).into_any_element(),
+                    None => chip.into_any_element(),
+                }
+            }));
+
+        // The transcript: newest first, a bounded scroll. The node Stream is a
+        // transcript you follow from the bottom; this one leads with the newest
+        // event because the reader's question is what the supervisor just did.
+        let transcript = v_flex()
+            .id(SharedString::from(format!("s{index}-stream")))
+            .w_full()
+            .max_h(rems_from_px(520_f32))
+            .overflow_y_scroll()
+            .gap(rems_from_px(2_f32))
+            .px_3()
+            .py_2()
+            .font(mono.clone())
+            .text_size(rems_from_px(12.5_f32))
+            .children(items.iter().enumerate().map(|(i, item)| {
+                let colour = str_of(item, "c");
+                let detail = str_of(item, "d");
+                let when = str_of(item, "when");
+                let acts = arr(item, "acts");
+                let handler = self.action_handler(item.get("do"), cx);
+                h_flex()
+                    .id(SharedString::from(format!("s{index}-feed-i{i}")))
+                    .items_start()
+                    .gap(rems_from_px(9_f32))
+                    .pl_2()
+                    .py_1()
+                    .border_l_2()
+                    .border_color(p::named(&colour))
+                    .when(handler.is_some(), |this| {
+                        this.cursor_pointer().hover(|s| s.bg(c(p::HOVER)))
+                    })
+                    .child(
+                        div()
+                            .flex_none()
+                            .w_3p5()
+                            .mt(px(1.))
+                            .text_size(rems_from_px(12_f32))
+                            .text_color(p::named(&colour))
+                            .child(str_of(item, "g")),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .items_baseline()
+                            .gap(rems_from_px(8_f32))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .min_w(rems_from_px(96_f32))
+                                    .font(mono.clone())
+                                    .text_size(rems_from_px(12.5_f32))
+                                    .text_color(p::named(&str_of(item, "tc")))
+                                    .child(str_of(item, "t")),
+                            )
+                            .when(!detail.is_empty(), |this| {
+                                this.child(
+                                    div().flex_1().min_w_0().truncate().child(self.texts.text(
+                                        format!("s{index}-feed-id{i}"),
+                                        &detail,
+                                        Look::new(11.5, c(p::SUB)).mono(true),
+                                        cx,
+                                    )),
+                                )
+                            }),
+                    )
+                    .when(!when.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .mt(px(2.))
+                                .font(mono.clone())
+                                .text_size(rems_from_px(11_f32))
+                                .text_color(c(p::SUB))
+                                .child(when),
+                        )
+                    })
+                    .when(!acts.is_empty(), |this| {
+                        this.child(h_flex().flex_none().gap(rems_from_px(5_f32)).children(
+                            acts.iter().enumerate().map(|(a, b)| {
+                                let handler = self.action_handler(b.get("do"), cx);
+                                let named_kind = str_of(b, "kind");
+                                let kind = if named_kind.is_empty() { "ghost" } else { &named_kind };
+                                p::button(
+                                    SharedString::from(format!("s{index}-feed-i{i}-a{a}")),
+                                    str_of(b, "label"),
+                                    kind,
+                                    22.,
+                                    11.5,
+                                    handler,
+                                )
+                            }),
+                        ))
+                    })
+                    .when_some(handler, |this, handler| this.on_click(handler))
+                    .into_any_element()
+            }))
+            .when(items.is_empty() && !empty.is_empty(), |this| {
+                this.child(p::text(empty.clone(), 12.5, p::DIM))
+            })
+            .when_some(s.get("more"), |this, more| {
+                let label = str_of(more, "t");
+                let handler = self.action_handler(more.get("do"), cx);
+                let line = h_flex()
+                    .id(SharedString::from(format!("s{index}-feed-more")))
+                    .py_1p5()
+                    .text_size(rems_from_px(11.5_f32))
+                    .text_color(c(p::BLUE))
+                    .child(label);
+                match handler {
+                    Some(handler) => this.child(line.cursor_pointer().hover(|s| s.underline()).on_click(handler)),
+                    None => this.child(line),
+                }
+            });
+
+        // The footer: the steering composer, docked like the node Stream's own.
+        // A finished run carries no `cli` and says so in `note` instead of
+        // drawing an input nothing would consume.
+        let footer = s.get("footer").cloned().unwrap_or(Value::Null);
+        let note = str_of(&footer, "note");
+        let cli: Vec<String> = arr(&footer, "cli")
+            .iter()
+            .map(|a| a.as_str().unwrap_or_default().to_string())
+            .collect();
+        let has_cli = !cli.is_empty();
+        let mut foot = v_flex()
+            .flex_none()
+            .gap_1p5()
+            .border_t_1()
+            .border_color(c(p::ROW_RULE))
+            .px_3p5()
+            .pt_2()
+            .pb_2p5();
+        if has_cli {
+            if let Some(composer) = self.composers.get(&index) {
+                let editor = composer.editor.clone();
+                let editor_empty = editor.text(cx).trim().is_empty();
+                let send: Arc<dyn Fn(&mut Window, &mut App)> = {
+                    let editor = editor.clone();
+                    let workspace = self.workspace.clone();
+                    let page = cx.entity().downgrade();
+                    let home = footer.get("home").cloned();
+                    Arc::new(move |window: &mut Window, cx: &mut App| {
+                        let text = editor.text(cx).trim().to_string();
+                        if text.is_empty() {
+                            return;
+                        }
+                        editor.clear(window, cx);
+                        let mut argv = cli.clone();
+                        argv.push(text);
+                        let mut action = serde_json::json!({ "cli": argv });
+                        if let Some(home) = home.clone() {
+                            action["home"] = home;
+                        }
+                        let Some(workspace) = workspace.upgrade() else {
+                            return;
+                        };
+                        let page = page.clone();
+                        window.defer(cx, move |window, cx| {
+                            store::perform(&action, &workspace, Origin::Page(page), window, cx);
+                        });
+                    })
+                };
+                let enter = send.clone();
+                let field = h_flex()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .gap_2()
+                    .items_center()
+                    .px_2p5()
+                    .py_1p5()
+                    .border_1()
+                    .border_color(c(p::DIM))
+                    .bg(c(0x262a31))
+                    .capture_key_down(cx.listener(move |_this, event: &KeyDownEvent, window, cx| {
+                        if event.keystroke.key == "enter" {
+                            enter(window, cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .child(p::text(">", 12.5, p::MUTED).font(mono.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_size(rems_from_px(12.5_f32))
+                            .child(editor.render(window, cx)),
+                    );
+                let on_send: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>> =
+                    if editor_empty {
+                        None
+                    } else {
+                        let send = send.clone();
+                        Some(Box::new(move |_event: &ClickEvent, window: &mut Window, cx: &mut App| {
+                            send(window, cx)
+                        }))
+                    };
+                foot = foot.child(h_flex().gap_2().items_center().child(field).child(p::button(
+                    SharedString::from(format!("s{index}-stream-send")),
+                    "Send",
+                    "primary",
+                    26.,
+                    12.,
+                    on_send,
+                )));
+            }
+        }
+        if !note.is_empty() {
+            foot = foot.child(
+                h_flex()
+                    .gap_3()
+                    .text_size(rems_from_px(11_f32))
+                    .font(mono.clone())
+                    .text_color(c(p::DIM))
+                    .child(note.clone()),
+            );
+        }
+
+        let mut panel = v_flex()
+            .id(SharedString::from(format!("s{index}-stream-panel")))
+            .w_full()
+            .min_w_0()
+            .border_1()
+            .border_color(c(p::BORDER))
+            .bg(c(0x1f2227))
+            .child(header);
+        if !arr(s, "filters").is_empty() {
+            panel = panel.child(v_flex().px_3p5().pb_1p5().child(filters));
+        }
+        panel = panel.child(transcript);
+        if has_cli || !note.is_empty() {
+            panel = panel.child(foot);
+        }
+        panel.into_any_element()
     }
 
     /// The Orca card the restyled `table` / `kv` / `list` sections share:
@@ -2227,7 +2541,14 @@ impl MiniOrkPage {
         let wanted: Vec<(usize, Value)> = arr(page, "sections")
             .into_iter()
             .enumerate()
-            .filter(|(_, section)| str_of(section, "type") == "composer")
+            .filter(|(_, section)| {
+                // A `composer` section is an editor of its own. A `feed` in its
+                // stream layout carries one in its footer, so both register
+                // here — the map is keyed by section index either way.
+                str_of(section, "type") == "composer"
+                    || (str_of(section, "type") == "feed"
+                        && !arr(section.get("footer").unwrap_or(&Value::Null), "cli").is_empty())
+            })
             .collect();
         let indices: Vec<usize> = wanted.iter().map(|(index, _)| *index).collect();
         self.composers.retain(|index, _| indices.contains(index));
@@ -2237,7 +2558,11 @@ impl MiniOrkPage {
             }
             let factory = ERASED_EDITOR_FACTORY.get().expect("editor factory is set at start-up");
             let editor = factory(window, cx);
-            let placeholder = str_of(&section, "placeholder");
+            let placeholder = if str_of(&section, "type") == "feed" {
+                str_of(section.get("footer").unwrap_or(&Value::Null), "placeholder")
+            } else {
+                str_of(&section, "placeholder")
+            };
             if !placeholder.is_empty() {
                 editor.set_placeholder_text(&placeholder, window, cx);
             }
