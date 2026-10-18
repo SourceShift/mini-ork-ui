@@ -64,13 +64,32 @@ impl MiniOrkStatus {
     }
 }
 
-fn toggle_board(workspace: &WeakEntity<Workspace>, cx: &mut App) {
-    with_sidebar(workspace, cx, |sidebar, cx| sidebar.toggle_board(cx));
+/// Show the run list: the status item is a door, not a switch.
+///
+/// The rail and the run dock share the right dock, so a click can find the
+/// dock holding the run page's Changes panel, or folded away entirely. Opening
+/// the panel first — activating it in its dock — is what makes one click on
+/// the footer always land on the run list; folding the board column stays on
+/// the rail's own control.
+fn toggle_board(workspace: &WeakEntity<Workspace>, window: &mut Window, cx: &mut App) {
+    let Some(workspace) = workspace.upgrade() else {
+        return;
+    };
+    workspace.update(cx, |workspace, cx| {
+        workspace.open_panel::<MiniOrkSidebar>(window, cx);
+    });
+    with_sidebar(&workspace.downgrade(), cx, |sidebar, cx| sidebar.show_board(cx));
 }
 
 /// Open the Threads board, where working and failed runs are grouped.
-fn show_board(workspace: &WeakEntity<Workspace>, cx: &mut App) {
-    with_sidebar(workspace, cx, |sidebar, cx| sidebar.show_board(cx));
+fn show_board(workspace: &WeakEntity<Workspace>, window: &mut Window, cx: &mut App) {
+    let Some(workspace) = workspace.upgrade() else {
+        return;
+    };
+    workspace.update(cx, |workspace, cx| {
+        workspace.open_panel::<MiniOrkSidebar>(window, cx);
+    });
+    with_sidebar(&workspace.downgrade(), cx, |sidebar, cx| sidebar.show_board(cx));
 }
 
 /// Run `f` on the rail, wherever the host mounted it.
@@ -128,7 +147,7 @@ impl Render for MiniOrkStatus {
                 .on_click(move |_, window, cx| {
                     let workspace = workspace.clone();
                     if key == "threads" {
-                        show_board(&workspace, cx);
+                        show_board(&workspace, window, cx);
                         return;
                     }
                     window.defer(cx, move |window, cx| {
@@ -166,7 +185,7 @@ impl Render for MiniOrkStatus {
                     .child("▤")
                     .on_click({
                         let w = w.clone();
-                        move |_, _, cx| toggle_board(&w, cx)
+                        move |_, window, cx| toggle_board(&w, window, cx)
                     }),
             )
             .child(Divider::vertical().h_3p5().mx_1().color(DividerColor::Border))
