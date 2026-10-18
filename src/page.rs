@@ -313,15 +313,22 @@ impl MiniOrkPage {
     }
 
     fn label(&self) -> String {
-        if self.key == "run" {
-            return run_label(self.args.get("run").map(String::as_str).unwrap_or("run"));
-        }
-        self.data
+        // The payload's label is the server's own name for the page: a run
+        // page sends the operator's title there, and until it loads (or when
+        // it fails) the id-derived label keeps the tab recognisable.
+        if let Some(label) = self
+            .data
             .as_ref()
             .and_then(|d| d.as_ref().ok())
             .and_then(|d| d.get("label").and_then(Value::as_str))
-            .map(String::from)
-            .unwrap_or_else(|| default_label(&self.key).to_string())
+            .filter(|label| !label.trim().is_empty())
+        {
+            return label.to_string();
+        }
+        if self.key == "run" {
+            return run_label(self.args.get("run").map(String::as_str).unwrap_or("run"));
+        }
+        default_label(&self.key).to_string()
     }
 
     pub fn set_args(&mut self, args: BTreeMap<String, String>, cx: &mut Context<Self>) {
@@ -768,6 +775,20 @@ impl MiniOrkPage {
                 .children(tabs.iter().enumerate().map(|(i, t)| {
                     let key = str_of(t, "key");
                     let on = key == current;
+                    // The badge is its own field (CONTRACT v2.1), so the label
+                    // stays the plain tab name. A zero is the quiet state and
+                    // is not drawn; a tone that is not ``sub`` with a zero
+                    // count still means "look here" (a parked run waiting on
+                    // an operator), so it keeps a mark rather than a 0.
+                    let count = t.get("count").and_then(Value::as_i64).unwrap_or(0);
+                    let tone = str_of(t, "tone");
+                    let badge = if count > 0 {
+                        Some((count.to_string(), tone))
+                    } else if !tone.is_empty() && tone != "sub" {
+                        Some(("•".to_string(), tone))
+                    } else {
+                        None
+                    };
                     div()
                         .id(("page-tab", i))
                         .px_2p5()
@@ -778,7 +799,25 @@ impl MiniOrkPage {
                         .border_color(if on { c(p::BLUE) } else { p::ca(0x00000000) })
                         .cursor_pointer()
                         .hover(|s| s.text_color(c(p::TEXT)))
-                        .child(str_of(t, "label"))
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .items_center()
+                                .child(str_of(t, "label"))
+                                .when_some(badge, |this, (text, tone)| {
+                                    this.child(
+                                        div()
+                                            .px(rems_from_px(5_f32))
+                                            .rounded(rems_from_px(999_f32))
+                                            .border_1()
+                                            .border_color(c(p::BORDER2))
+                                            .text_size(rems_from_px(10_f32))
+                                            .font(p::mono_font(cx))
+                                            .text_color(p::named(&tone))
+                                            .child(text),
+                                    )
+                                }),
+                        )
                         .on_click(cx.listener(move |this, _, _, cx| this.set_tab(key.clone(), cx)))
                 }))
                 .into_any_element(),
@@ -844,9 +883,9 @@ impl MiniOrkPage {
                     for (i, s) in pair {
                         row = row.child(div().flex_1().min_w_0().flex().child(this.render_section_card(&tab, *i, s, window, cx)));
                     }
-                    if pair.len() == 1 {
-                        row = row.child(div().flex_1().min_w_0());
-                    }
+                    // An odd card spans the row. A spacer beside it halved
+                    // the card for no reason but parity, leaving the page's
+                    // last section narrow and the row's right half blank.
                     rows.push(row.into_any_element());
                 }
             }
@@ -931,14 +970,24 @@ impl MiniOrkPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        div()
+        let card = div()
             .id(Self::section_id(tab, index, s))
             .w_full()
             .min_w_0()
             .relative()
-            .child(self.render_section(index, s, window, cx))
-            .child(self.section_json_copy(index, s))
-            .into_any_element()
+            .child(self.render_section(index, s, window, cx));
+        // The JSON copy button is authoring chrome: it sits in the card's
+        // top-right corner where a reader expects a control, and copies a
+        // payload only the engine author ever inspects. Off by default; the
+        // inspector workflow turns it on with ``MINI_ORK_UI_DEBUG_JSON=1``.
+        let debug_json = std::env::var("MINI_ORK_UI_DEBUG_JSON")
+            .map(|value| !value.is_empty() && value != "0")
+            .unwrap_or(false);
+        if debug_json {
+            card.child(self.section_json_copy(index, s)).into_any_element()
+        } else {
+            card.into_any_element()
+        }
     }
 
     /// `{ }` — this section's payload: the JSON the engine sent and the card
