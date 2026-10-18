@@ -1,10 +1,11 @@
-//! The right-hand Run panel: the active run's dock view — Changes · Checks ·
-//! Agents · Cost · Learned — one column beside the session, the way Orca keeps
-//! a worktree's Source Control and Checks next to the session.
+//! The right-hand Run panel: the active run at a glance — outcome, failing
+//! checks, spend, changed files — one column beside the session, the way Orca
+//! keeps a worktree's Source Control and Checks next to the session.
 //!
 //! The panel is a thin host: it follows the workspace's active run and hosts a
-//! [`MiniOrkPage`] built with `view=dock`. The page's own tab bar switches the
-//! dock's tabs; it reloads with the board store, but only while the panel is
+//! [`MiniOrkPage`] built with `view=dock`. The payload carries no tab bar (the
+//! run page owns every full view; the dock links into it), so the panel is a
+//! single column. It reloads with the board store, but only while the panel is
 //! the visible panel of its dock, so a closed panel never polls.
 
 use gpui::{

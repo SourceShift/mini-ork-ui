@@ -282,9 +282,10 @@ impl MiniOrkPage {
     }
 
     /// The right-hand Run panel's page: the run's `view=dock` view, with the
-    /// page header and outer padding hidden. `tab` picks the dock tab
-    /// (`changes`, `checks`, `agents`, `cost`, `learned`), defaulting to
-    /// `changes` at the server.
+    /// page header and outer padding hidden. The dock has one view (a glance
+    /// column: outcome, failing checks, spend, changes) and no tab bar — the
+    /// run page's tab bar is the only tab surface. `tab` is carried for the
+    /// saved page state; the server ignores it.
     pub fn new_dock(
         run: String,
         tab: Option<String>,
