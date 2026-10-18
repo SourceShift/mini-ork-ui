@@ -122,16 +122,26 @@ pub fn init(cx: &mut App) {
 /// carries the page's args, so `thread?thread=<id>` opens one thread.
 fn startup_layout(window: &mut Window, cx: &mut Context<Workspace>) {
     cx.spawn_in(window, async move |workspace, cx| {
-        // The first board read takes longer than loading the panels.
+        // Wait for the first board read — and for the window's own restore to
+        // finish. They are independent async tasks: `open_items` deserializes
+        // the saved panes and only then applies the persisted dock layout,
+        // which on a workspace whose right dock was last seen closed carries
+        // `right_dock_visible = false`. The board read usually wins that race
+        // (it is one HTTP call), so opening the rail before the restore lands
+        // is what folds it shut again a moment later. `is_restoring` covers
+        // the gap from the restore's first poll to the dock state being
+        // applied; a workspace that never restores (a fresh one) is ready as
+        // soon as the board is.
         for _ in 0..200 {
             let ready = workspace
-                .update(cx, |_, cx| {
-                    BoardStore::for_workspace(&cx.entity(), cx)
+                .update(cx, |workspace, cx| {
+                    let board_ready = BoardStore::for_workspace(&cx.entity(), cx)
                         .map(|store| {
                             let store = store.read(cx);
                             store.board.is_some() || store.error.is_some()
                         })
-                        .unwrap_or(false)
+                        .unwrap_or(false);
+                    board_ready && !workspace.is_restoring()
                 })
                 .unwrap_or(true);
             if ready {
@@ -143,11 +153,10 @@ fn startup_layout(window: &mut Window, cx: &mut Context<Workspace>) {
             .update_in(cx, |workspace, window, cx| {
                 workspace.open_panel::<agent_ui::AgentPanel>(window, cx);
                 // The rail's own dock opens with it (`starts_open`), but that
-                // runs when the panel is added and this runs later, once the
-                // first board read has landed. Opening it again here is what
-                // keeps the dock from sitting on a panel that is not there yet
-                // — and what replaced the `set_open(false)` that used to hide
-                // the rail outright.
+                // runs when the panel is added — before the workspace restore
+                // applies the saved dock state. Opening it again here, after
+                // that restore has landed, is what makes the rail stay put
+                // instead of being folded shut by last session's layout.
                 workspace.open_panel::<MiniOrkSidebar>(window, cx);
                 let Ok(spec) = std::env::var("MINI_ORK_IDE_OPEN") else {
                     return;
