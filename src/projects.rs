@@ -236,6 +236,7 @@ pub fn worktree_label(workspace: &Entity<Workspace>, cx: &App) -> Option<SharedS
     project::git_store::linked_worktree_short_name(
         repository.main_worktree_abs_path()?,
         &repository.work_directory_abs_path,
+        repository.path_style,
     )
 }
 
