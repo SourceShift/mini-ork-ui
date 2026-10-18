@@ -17,9 +17,9 @@
 //! the IDE the speedup and nothing else.
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU8, Ordering},
     },
     time::{Duration, Instant},
@@ -58,6 +58,11 @@ static STARTED_AT: OnceLock<Instant> = OnceLock::new();
 /// The app's HTTP client, handed over once by `store::init`. Until then no
 /// request is made and every read takes the subprocess path.
 static HTTP: OnceLock<Arc<dyn HttpClient>> = OnceLock::new();
+/// The home this process last confirmed the server on `PORT` serves. The port
+/// is one fixed number, so the server that answers may have been started for
+/// another project — including an older build that ignores the `home` query
+/// and would happily answer with its own project's data.
+static HOME_CHECK: Mutex<Option<(PathBuf, bool)>> = Mutex::new(None);
 
 pub fn init(client: Arc<dyn HttpClient>) {
     HTTP.set(client).ok();
@@ -87,6 +92,12 @@ pub async fn get(bin: &Path, home: &Path, path: &str, query: &[(&str, String)]) 
     match probe(home, path, query).await {
         Probe::Payload(value) => {
             STATE.store(UP, Ordering::Relaxed);
+            // A payload from a server that serves a different home is not this
+            // project's data, however well-formed it looks. Fall back rather
+            // than display another project's run.
+            if !home_is_served(home).await {
+                return None;
+            }
             Some(value)
         }
         Probe::Rejected => {
@@ -117,6 +128,67 @@ pub async fn get(bin: &Path, home: &Path, path: &str, query: &[(&str, String)]) 
             }
             None
         }
+    }
+}
+
+/// Whether the server on `PORT` resolves `home` as its active project. The
+/// server is asked for its own view (`/api/v1/projects`) rather than trusted to
+/// have honoured the `home` parameter on the read that got us here: a server
+/// started before per-request homes existed answers with its own project and
+/// looks perfectly healthy doing it. Checked once per home, since the answer
+/// cannot change while the same process owns the port.
+async fn home_is_served(home: &Path) -> bool {
+    let checked = HOME_CHECK.lock().ok().and_then(|slot| slot.clone());
+    if let Some((cached, served)) = checked {
+        if cached == home {
+            return served;
+        }
+    }
+    let Some(client) = HTTP.get() else {
+        return false;
+    };
+    let Ok(mut url) = Url::parse(&format!("http://127.0.0.1:{PORT}/api/v1/projects")) else {
+        return false;
+    };
+    url.query_pairs_mut().append_pair("home", &home.display().to_string());
+    let Ok(request) = Request::get(url.as_str())
+        .timeout(REQUEST_TIMEOUT)
+        .body(AsyncBody::default())
+    else {
+        return false;
+    };
+    let Ok(mut response) = client.send(request).await else {
+        return false;
+    };
+    if response.status() != StatusCode::OK {
+        return false;
+    }
+    let mut body = Vec::new();
+    if response.body_mut().read_to_end(&mut body).await.is_err() {
+        return false;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(&body) else {
+        return false;
+    };
+    let active = value.get("active").and_then(Value::as_str).unwrap_or_default();
+    let served = same_path(active, home);
+    if let Ok(mut slot) = HOME_CHECK.lock() {
+        *slot = Some((home.to_path_buf(), served));
+    }
+    served
+}
+
+/// Compare a path the server reported with the one this process asked for.
+/// Both are canonicalised because macOS reports `/private/tmp` for a `/tmp`
+/// home, and a symlinked project directory is the same project.
+fn same_path(reported: &str, home: &Path) -> bool {
+    if reported.is_empty() {
+        return false;
+    }
+    let reported = Path::new(reported);
+    match (reported.canonicalize(), home.canonicalize()) {
+        (Ok(reported), Ok(home)) => reported == home,
+        _ => reported == home,
     }
 }
 
@@ -189,5 +261,33 @@ fn start(bin: &Path, home: &Path) {
     }
     if let Err(error) = command.spawn() {
         log::warn!("mini-ork: could not start the IDE server: {error:#}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_path;
+    use std::path::Path;
+
+    #[test]
+    fn an_empty_reported_home_never_matches() {
+        assert!(!same_path("", Path::new("/tmp")));
+    }
+
+    #[test]
+    fn only_the_same_directory_matches() {
+        assert!(same_path("/tmp", Path::new("/tmp")));
+        assert!(!same_path("/var", Path::new("/tmp")));
+    }
+
+    #[test]
+    fn a_symlinked_home_matches_its_target() {
+        // macOS reports /private/tmp for a /tmp home, and a project directory
+        // reached through a symlink is the same project. Both spellings must
+        // compare equal, or every read on that home falls back to a subprocess.
+        let Ok(canonical) = std::fs::canonicalize("/tmp") else {
+            return;
+        };
+        assert!(same_path(&canonical.to_string_lossy(), Path::new("/tmp")));
     }
 }

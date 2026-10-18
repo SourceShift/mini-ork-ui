@@ -724,6 +724,22 @@ fn mark(state: &str) -> (&'static str, u32) {
     }
 }
 
+/// The roles `mini-ork board steer --role` accepts (the engine's
+/// `operator_steering._VALID_ROLES`).
+const STEER_ROLES: [&str; 5] = ["planner", "implementer", "reviewer", "verifier", "any"];
+
+/// The `--role` a steer carries. A node's `role` is its lane — `glm_lens`,
+/// `minimax.lens` — which the engine rejects, so anything outside the accepted
+/// set is sent as `any`: the note still reaches the node, and the engine's own
+/// role resolution decides who consumes it.
+fn steer_role(node_role: &str) -> String {
+    if STEER_ROLES.contains(&node_role) {
+        node_role.to_string()
+    } else {
+        "any".to_string()
+    }
+}
+
 fn state_text(state: &str) -> &str {
     match state {
         "running" => "working",
@@ -1167,7 +1183,7 @@ impl MiniOrkGraph {
             return;
         }
         self.steer.clear(window, cx);
-        let role = if node.role.is_empty() { "any".to_string() } else { node.role.clone() };
+        let role = steer_role(&node.role);
         let args = vec![
             "board".to_string(),
             "steer".into(),
@@ -2637,7 +2653,11 @@ impl MiniOrkGraph {
             .and_then(|c| visible.iter().position(|&i| i == c))
             .map(|p| p + 1);
         let transcript_text = self.stream.iter().map(entry_text).collect::<Vec<_>>().join("\n");
-        let running = live && node.state == "running";
+        // `live` is the stream's own answer (`board node --view stream`, polled
+        // every 1.5 s). `node.state` comes from the run page, which may be a
+        // poll behind — gating the steer box on it hides the box under a live
+        // transcript when the page read fails or lags.
+        let running = live;
         let source = str_of(detail, "source");
         let count = |kind: &str| -> usize {
             self.stream
@@ -3567,6 +3587,19 @@ mod tests {
         assert_eq!(zoom_knob(Some("1.5"), 0.4, 0.05, 4.), 1.5);
         assert_eq!(zoom_knob(Some(" 2.5 "), 0.4, 0.05, 4.), 2.5);
         assert_eq!(zoom_knob(Some("0.05"), 0.4, 0.05, 4.), 0.05, "the bounds are inclusive");
+    }
+
+    #[test]
+    fn a_lane_steers_as_any_and_a_known_role_is_kept() {
+        // `node.role` on the page is the lane (`glm_lens`), which the engine's
+        // steer validator rejects. Sending it would make the box fail on every
+        // Enter; the note must still go out.
+        assert_eq!(steer_role("glm_lens"), "any");
+        assert_eq!(steer_role("minimax.lens"), "any");
+        assert_eq!(steer_role(""), "any");
+        for role in STEER_ROLES {
+            assert_eq!(steer_role(role), role);
+        }
     }
 
     #[test]

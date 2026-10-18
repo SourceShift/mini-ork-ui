@@ -239,8 +239,8 @@ pub async fn fetch_runs(bin: PathBuf, home: PathBuf, query: String, offset: usiz
     }
     argv.extend(["--offset".into(), offset.to_string(), "--limit".into(), limit.to_string()]);
     let value = match crate::ide_http::get(&bin, &home, "/ide/runs", &http).await {
-        Some(value) => value,
-        None => run_json(&bin, &argv, &home).await?,
+        Some(value) if value.get("ok").and_then(Value::as_bool) != Some(false) => value,
+        _ => run_json(&bin, &argv, &home).await?,
     };
     if value.get("ok").and_then(Value::as_bool) == Some(false) {
         return Err(anyhow!("{}", value.get("error").and_then(Value::as_str).unwrap_or("search failed")));
@@ -260,15 +260,17 @@ pub async fn fetch_node(
     offset: Option<u64>,
 ) -> Result<Value> {
     let mut argv = vec!["board".to_string(), "node".into(), run.clone(), node.clone(), "--view".into(), view.clone()];
-    let mut http = vec![("view", view)];
+    let mut http = vec![("run", run.clone()), ("node", node.clone()), ("view", view)];
     if let Some(offset) = offset {
         argv.push("--offset".into());
         argv.push(offset.to_string());
         http.push(("offset", offset.to_string()));
     }
-    let value = match crate::ide_http::get(&bin, &home, &format!("/ide/node/{run}/{node}"), &http).await {
-        Some(value) => value,
-        None => run_json(&bin, &argv, &home).await?,
+    // The route is query-style (`/ide/node?run=…&node=…`); a path-style URL
+    // 404s on every server and silently costs a subprocess per poll.
+    let value = match crate::ide_http::get(&bin, &home, "/ide/node", &http).await {
+        Some(value) if value.get("ok").and_then(Value::as_bool) != Some(false) => value,
+        _ => run_json(&bin, &argv, &home).await?,
     };
     if value.get("ok").and_then(Value::as_bool) == Some(false) {
         return Err(anyhow!(
@@ -304,8 +306,12 @@ pub async fn fetch_page(
         http.push(("arg", format!("{k}={v}")));
     }
     let value = match crate::ide_http::get(&bin, &home, "/ide/page", &http).await {
-        Some(value) => value,
-        None => run_json(&bin, &argv, &home).await?,
+        // A server that answers `ok: false` cannot render this page — most
+        // often it is a daemon that belongs to another project. Take the
+        // subprocess path, exactly as an unreachable server does, instead of
+        // letting one project's daemon freeze another project's page.
+        Some(value) if value.get("ok").and_then(Value::as_bool) != Some(false) => value,
+        _ => run_json(&bin, &argv, &home).await?,
     };
     if value.get("ok").and_then(Value::as_bool) == Some(false) {
         return Err(anyhow!(
