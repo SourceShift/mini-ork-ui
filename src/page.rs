@@ -2066,11 +2066,6 @@ impl MiniOrkPage {
 
     fn render_dag(&self, index: usize, s: &Value, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let mono = p::mono_font(cx);
-        // `select` means this DAG is the run page's own DAG tab: a click picks
-        // the node *in place*, so the detail below the graph follows the click
-        // the way the design shows. Every other DAG (the node tab's canvas,
-        // the strip) keeps the click-to-open behaviour.
-        let select_mode = bool_of(s, "select");
         // The canvas a node tab leads with, drawn here from the same model, so
         // the run page's DAG and the DAG tab's DAG cannot drift into two
         // pictures of one run. The payload is already in memory (`self.data`),
@@ -2161,11 +2156,7 @@ impl MiniOrkPage {
                     el.cursor_pointer()
                         .hover(|s| s.border_color(c(p::BLUE)))
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            if select_mode {
-                                this.select_node(node_id.clone(), cx);
-                            } else {
-                                this.open_node_tab(node_id.clone(), window, cx);
-                            }
+                            this.open_node_tab(node_id.clone(), window, cx);
                         }))
                         .into_any_element()
                 })));
@@ -2206,11 +2197,7 @@ impl MiniOrkPage {
                 // act through `Origin::Page` rather than going nowhere.
                 let on_node = std::rc::Rc::new(move |node: &str, window: &mut Window, cx: &mut App| {
                     page.update(cx, |this, cx| {
-                        if select_mode {
-                            this.select_node(node.to_string(), cx);
-                        } else {
-                            this.open_node_tab(node.to_string(), window, cx);
-                        }
+                        this.open_node_tab(node.to_string(), window, cx);
                     })
                     .ok();
                 });
@@ -2632,15 +2619,6 @@ impl MiniOrkPage {
         }
     }
 
-    /// Pick a node *within* this page: the DAG tab's detail below the graph
-    /// is the engine's render of `args.node`, so the click is a re-fetch with
-    /// one argument merged. The node tab stays one button away (`Open node`).
-    pub(crate) fn select_node(&mut self, node: String, cx: &mut Context<Self>) {
-        let mut args = BTreeMap::new();
-        args.insert("node".to_string(), node);
-        self.set_args(args, cx);
-    }
-
     /// Zoom the flow map to `zoom`, keeping the point under the pointer where
     /// it is. `before` is the zoom the pointer's position was measured at.
     pub(crate) fn zoom_flow_from(
@@ -2750,19 +2728,15 @@ impl MiniOrkPage {
         // keeps whatever is selected, so a live run does not yank the reader
         // off the node they are looking at every time the board moves.
         let focus = model.last_ran().map(|node| node.id.clone());
-        // The run page renders the graph inside its DAG tab with the node's
-        // detail below it; no other run-keyed page does.
-        let select_page = self.key == "run";
         let (workspace, page_handle) = (self.workspace.clone(), cx.entity().downgrade());
         let graph = cx.new(|cx| {
             let mut graph = crate::graph::MiniOrkGraph::new(model, focus, workspace, page_handle, window, cx);
             graph.tab_mode = true;
-            // The run page carries its own chrome: the DAG tab's node detail
-            // below the graph and the rest of the page's sections. The graph
-            // draws no inspector of its own, and a click selects in place so
-            // that detail follows it.
+            // The run page carries its own chrome: the DAG tab's sections
+            // below the graph. The graph draws no inspector of its own, and a
+            // click opens the node's own tab, the same page an agents-table
+            // row opens.
             graph.strip_only = true;
-            graph.select_page = select_page;
             graph
         });
         // The pills row rides with the node Overview, and the graph's own
