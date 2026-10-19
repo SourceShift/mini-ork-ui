@@ -26,6 +26,7 @@ use workspace::{
 
 use crate::{
     board, components,
+    graph::{EntryToggle, stream_entry},
     loading::{self, Shape},
     select::{Look, Texts},
     palette::{self as p, c},
@@ -172,6 +173,12 @@ pub struct MiniOrkPage {
     /// because the page, not a `MiniOrkGraph`, owns this canvas. Anything a
     /// button or the wheel sets is kept, and `Fit` clears it back to `None`.
     dag_zoom: Option<f32>,
+    /// The Orchestrator tab's transcript: the orchestrator agent's own
+    /// stream, drawn with the node Stream's rows and followed from the
+    /// bottom. `orch_seen` is the entry count last followed, so a re-fetch
+    /// sticks to the newest line only when the transcript actually grew.
+    orch_scroll: ScrollHandle,
+    orch_seen: std::cell::Cell<usize>,
     /// The run flow map scrolls sideways over its own track.
     pub(crate) flow_scroll: ScrollHandle,
     /// The flow map's zoom. Unlike the DAG canvas' `dag_zoom` there is no fit to
@@ -256,6 +263,8 @@ impl MiniOrkPage {
             dag_drag: Default::default(),
             dag_edge: None,
             dag_zoom: None,
+            orch_scroll: ScrollHandle::new(),
+            orch_seen: std::cell::Cell::new(0),
             flow_scroll: ScrollHandle::new(),
             flow_zoom: 1.,
             flow_full: false,
@@ -1654,10 +1663,85 @@ impl MiniOrkPage {
                 }
             }));
 
-        // The transcript: newest first, a bounded scroll. The node Stream is a
-        // transcript you follow from the bottom; this one leads with the newest
-        // event because the reader's question is what the supervisor just did.
-        let transcript = v_flex()
+        // The transcript. An orchestrator stream (`entries`) is an agent's
+        // conversation: the same rows the node Stream draws, oldest first,
+        // followed from the bottom while the turn is live. The event log
+        // (`items`) stays newest first — the reader's question there is what
+        // the watcher just did — and keeps the plain row shape.
+        let transcript: AnyElement = if s.get("entries").is_some() {
+            let entries = arr(s, "entries");
+            let grown = entries.len() > self.orch_seen.get();
+            self.orch_seen.set(entries.len());
+            if grown {
+                self.orch_scroll.scroll_to_bottom();
+            }
+            let mut body = v_flex()
+                .id(SharedString::from(format!("s{index}-stream")))
+                .w_full()
+                .max_h(rems_from_px(520_f32))
+                .overflow_y_scroll()
+                .track_scroll(&self.orch_scroll)
+                .gap(rems_from_px(9_f32))
+                .px_3()
+                .py_2()
+                .font(mono.clone())
+                .text_size(rems_from_px(12.5_f32))
+                .line_height(rems_from_px(20_f32))
+                .when_some(s.get("more"), |this, more| {
+                    let label = str_of(more, "t");
+                    let handler = self.action_handler(more.get("do"), cx);
+                    let line = h_flex()
+                        .id(SharedString::from(format!("s{index}-feed-more")))
+                        .py_1p5()
+                        .text_center()
+                        .text_size(rems_from_px(11.5_f32))
+                        .text_color(c(p::BLUE))
+                        .child(label);
+                    match handler {
+                        Some(handler) => this
+                            .child(line.cursor_pointer().hover(|s| s.underline()).on_click(handler)),
+                        None => this.child(line),
+                    }
+                });
+            let rows: Vec<AnyElement> = entries
+                .iter()
+                .enumerate()
+                .map(|(i, entry)| {
+                    let key = format!("s{index}-e{i}");
+                    let expanded = self.expanded.contains(&key);
+                    let toggle: EntryToggle = Box::new(cx.listener({
+                        let key = key.clone();
+                        move |this: &mut Self, _, _, cx| {
+                            if !this.expanded.insert(key.clone()) {
+                                this.expanded.remove(&key);
+                            }
+                            cx.notify();
+                        }
+                    }));
+                    div()
+                        .id(SharedString::from(key))
+                        .pl_2()
+                        .py_0p5()
+                        .child(stream_entry(&self.texts, i, entry, expanded, toggle, cx))
+                        .into_any_element()
+                })
+                .collect();
+            body = body.children(rows).when(entries.is_empty() && !empty.is_empty(), |this| {
+                this.child(p::text(empty.clone(), 12.5, p::DIM))
+            });
+            if bool_of(s, "live") {
+                body = body.child(
+                    h_flex()
+                        .gap(rems_from_px(9_f32))
+                        .pl_2p5()
+                        .text_color(c(p::ORANGE))
+                        .child("Working…")
+                        .child(p::text("· the orchestrator is streaming its turn", 12.5, p::DIM)),
+                );
+            }
+            body.into_any_element()
+        } else {
+            v_flex()
             .id(SharedString::from(format!("s{index}-stream")))
             .w_full()
             .max_h(rems_from_px(520_f32))
@@ -1766,7 +1850,9 @@ impl MiniOrkPage {
                     Some(handler) => this.child(line.cursor_pointer().hover(|s| s.underline()).on_click(handler)),
                     None => this.child(line),
                 }
-            });
+            })
+            .into_any_element()
+        };
 
         // The footer: the steering composer, docked like the node Stream's own.
         // A finished run carries no `cli` and says so in `note` instead of

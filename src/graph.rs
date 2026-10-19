@@ -614,6 +614,11 @@ enum NavTo {
 
 /// Tool results longer than this show their first lines and "+N lines".
 const COLLAPSED_LINES: usize = 4;
+
+/// The click handler a stream entry's "show more" row runs. The node tab
+/// toggles its own `expanded` set; the run page toggles a section-keyed one,
+/// so the renderer takes the handler rather than reaching for either.
+pub(crate) type EntryToggle = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 /// How many stream entries render at once. A live agent's transcript grows
 /// for hours, and every frame lays out every entry on screen — the window
 /// keeps that bounded, with "show earlier" to extend it.
@@ -2953,11 +2958,38 @@ fn entry_text(e: &Value) -> String {
 }
 
 impl MiniOrkGraph {
-    /// One transcript entry: `user`/`steer` boxes, `note` asides, and rows —
-    /// `⏺ Tool(args)` with `⎿` result lines, `✻ Thinking…`, text, todos.
-    /// Every piece of text is selectable.
+    /// One transcript entry, rendered by the shared [`stream_entry`]. The
+    /// node's expansion and its redraw are this view's business; the entry
+    /// grammar is not, because the run page's Orchestrator tab draws the
+    /// orchestrator agent's transcript with the same rows.
     fn stream_entry(&self, index: usize, e: &Value, cx: &mut Context<Self>) -> AnyElement {
-        let kind = str_of(e, "k");
+        let expanded = self.expanded.contains(&index);
+        let toggle: EntryToggle = Box::new(cx.listener(move |this: &mut Self, _, _, cx| {
+            if !this.expanded.insert(index) {
+                this.expanded.remove(&index);
+            }
+            cx.notify();
+        }));
+        stream_entry(&self.texts, index, e, expanded, toggle, cx)
+    }
+}
+
+/// One transcript entry: `user`/`steer` boxes, `note` asides, and rows —
+/// `⏺ Tool(args)` with `⎿` result lines, `✻ Thinking…`, text, todos. Every
+/// piece of text is selectable.
+///
+/// Free rather than a method because two hosts draw this grammar: the node
+/// tab ([`MiniOrkGraph`]) and the run page's Orchestrator tab, whose
+/// transcript is the orchestrator agent's own thread.
+pub(crate) fn stream_entry<T: 'static>(
+    texts: &Texts,
+    index: usize,
+    e: &Value,
+    expanded: bool,
+    on_toggle: EntryToggle,
+    cx: &mut Context<T>,
+) -> AnyElement {
+    let kind = str_of(e, "k");
         let head = str_of(e, "head");
         let arg = str_of(e, "arg");
         let lines = arr(e, "lines");
@@ -2977,7 +3009,7 @@ impl MiniOrkGraph {
                             .gap_1p5()
                             .child(p::text(">", 12.5, if steer { p::YELLOW } else { p::SUB }))
                             .child(
-                                self.texts.nested_scroll(
+                                texts.nested_scroll(
                                     key("box-scroll"),
                                     div()
                                         .id(SharedString::from(key("box-scroll")))
@@ -2986,10 +3018,10 @@ impl MiniOrkGraph {
                                         .max_h(rems_from_px(360_f32))
                                         .overflow_y_scroll()
                                         .child(if steer {
-                                            self.texts.text(key("box"), format!("{head}{arg}"), Look::new(12.5, c(p::YELLOW)).mono(true), cx)
+                                            texts.text(key("box"), format!("{head}{arg}"), Look::new(12.5, c(p::YELLOW)).mono(true), cx)
                                         } else {
                                             // The prompt is a markdown document: render it whole.
-                                            self.texts.markdown(key("box"), format!("{head}{arg}"), Look::new(12.5, c(p::TEXT)), cx)
+                                            texts.markdown(key("box"), format!("{head}{arg}"), Look::new(12.5, c(p::TEXT)), cx)
                                         }),
                                 ),
                             ),
@@ -2998,7 +3030,7 @@ impl MiniOrkGraph {
             }
             "note" => div()
                 .pl_5()
-                .child(self.texts.text(key("note"), format!("⎿  {arg}"), Look::new(11.5, c(p::DIM)).mono(true), cx))
+                .child(texts.text(key("note"), format!("⎿  {arg}"), Look::new(11.5, c(p::DIM)).mono(true), cx))
                 .into_any_element(),
             _ => {
                 let (dot, dot_colour, italic) = match kind.as_str() {
@@ -3011,7 +3043,6 @@ impl MiniOrkGraph {
                     _ => ("⏺", p::TEXT, false),
                 };
                 let arg_text = if kind == "tool" && !arg.is_empty() { format!("({arg})") } else { arg };
-                let expanded = self.expanded.contains(&index);
                 let hidden = if !expanded && lines.len() > COLLAPSED_LINES + 1 { lines.len() - COLLAPSED_LINES } else { 0 };
                 let mut line_els: Vec<AnyElement> = lines
                     .iter()
@@ -3027,7 +3058,7 @@ impl MiniOrkGraph {
                         div()
                             .px_1p5()
                             .when_some(bg, |this, bg| this.bg(bg))
-                            .child(self.texts.text(
+                            .child(texts.text(
                                 key(&format!("l{i}")),
                                 str_of(l, "t"),
                                 Look::new(12., if colour.is_empty() { c(p::MUTED) } else { p::named(&colour) }).mono(true).nowrap(),
@@ -3047,21 +3078,16 @@ impl MiniOrkGraph {
                             .cursor_pointer()
                             .hover(|s| s.underline())
                             .child(label)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if !this.expanded.insert(index) {
-                                    this.expanded.remove(&index);
-                                }
-                                cx.notify();
-                            }))
+                            .on_click(move |event, window, cx| on_toggle(event, window, cx))
                             .into_any_element(),
                     );
                 }
                 let head_el = (!head.is_empty())
-                    .then(|| self.texts.text(key("head"), &head, Look::new(12.5, c(p::TEXT)).mono(true).bold(true).italic(italic), cx));
+                    .then(|| texts.text(key("head"), &head, Look::new(12.5, c(p::TEXT)).mono(true).bold(true).italic(italic), cx));
                 let arg_el = (!arg_text.is_empty()).then(|| {
                     if kind == "text" {
                         // Agent text is markdown: whole, capped, scrollable.
-                        self.texts
+                        texts
                             .nested_scroll(
                                 key("text-scroll"),
                                 div()
@@ -3069,14 +3095,14 @@ impl MiniOrkGraph {
                                     .w_full()
                                     .max_h(rems_from_px(360_f32))
                                     .overflow_y_scroll()
-                                    .child(self.texts.markdown(key("arg"), &arg_text, Look::new(12.5, c(p::TEXT)), cx)),
+                                    .child(texts.markdown(key("arg"), &arg_text, Look::new(12.5, c(p::TEXT)), cx)),
                             )
                             .into_any_element()
                     } else {
                         div()
                             .w_full()
                             .min_w_0()
-                            .child(self.texts.text(key("arg"), &arg_text, Look::new(12.5, c(p::MUTED)).mono(true).italic(italic), cx))
+                            .child(texts.text(key("arg"), &arg_text, Look::new(12.5, c(p::MUTED)).mono(true).italic(italic), cx))
                             .into_any_element()
                     }
                 });
@@ -3104,7 +3130,6 @@ impl MiniOrkGraph {
                     .into_any_element()
             }
         }
-    }
 }
 
 impl Render for MiniOrkGraph {
