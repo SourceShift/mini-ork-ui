@@ -96,7 +96,7 @@ pub fn init(cx: &mut App) {
     cx.default_global::<PageCache>();
     // The IDE's reads go over loopback when a `mini-ork serve` answers
     // (see `ide_http`); it needs the app's client to make them.
-    crate::ide_http::init(cx.http_client());
+    crate::ide_http::init(cx.http_client(), cx.background_executor().clone());
     cx.observe_new(|_workspace: &mut Workspace, window, cx| {
         let id = cx.entity().entity_id();
         let weak = cx.entity().downgrade();

@@ -208,13 +208,29 @@ async fn run_json(bin: &Path, args: &[String], home: &Path) -> Result<Value> {
         .await
         .with_context(|| format!("running {}", bin.display()))?;
     let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow!(
-            "mini-ork {} failed: {}",
+            "mini-ork {} failed: {}{}",
             args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
+            stderr.trim(),
+            permission_hint(&stderr)
         )
     })?;
     Ok(value)
+}
+
+/// macOS denies an app the read of a volume it has no grant for, and Python
+/// reports that as a traceback about its own `pyvenv.cfg` — a message that
+/// names neither the cause nor the fix. When the failure is that denial, say
+/// what to change; anything else is left to the engine's own error.
+fn permission_hint(stderr: &str) -> &'static str {
+    if stderr.contains("Operation not permitted") || stderr.contains("PermissionError") {
+        "\n\nmacOS is not letting the IDE read the mini-ork checkout. Allow \
+         “mini-ork IDE” under System Settings → Privacy & Security → Removable \
+         Volumes (or Full Disk Access), then relaunch it with script/mini-ork-ide."
+    } else {
+        ""
+    }
 }
 
 /// A page of runs (`mini-ork board runs [--query Q] --offset N --limit M`): full-text
@@ -238,9 +254,12 @@ pub async fn fetch_runs(bin: PathBuf, home: PathBuf, query: String, offset: usiz
         http.push(("query", query.trim().to_string()));
     }
     argv.extend(["--offset".into(), offset.to_string(), "--limit".into(), limit.to_string()]);
+    // `ide_http` only answers with a server this project's own reads can use,
+    // and an `ok: false` payload from that server is the search's own failure —
+    // reported below rather than re-run as a subprocess.
     let value = match crate::ide_http::get(&bin, &home, "/ide/runs", &http).await {
-        Some(value) if value.get("ok").and_then(Value::as_bool) != Some(false) => value,
-        _ => run_json(&bin, &argv, &home).await?,
+        Some(value) => value,
+        None => run_json(&bin, &argv, &home).await?,
     };
     if value.get("ok").and_then(Value::as_bool) == Some(false) {
         return Err(anyhow!("{}", value.get("error").and_then(Value::as_str).unwrap_or("search failed")));
@@ -269,8 +288,8 @@ pub async fn fetch_node(
     // The route is query-style (`/ide/node?run=…&node=…`); a path-style URL
     // 404s on every server and silently costs a subprocess per poll.
     let value = match crate::ide_http::get(&bin, &home, "/ide/node", &http).await {
-        Some(value) if value.get("ok").and_then(Value::as_bool) != Some(false) => value,
-        _ => run_json(&bin, &argv, &home).await?,
+        Some(value) => value,
+        None => run_json(&bin, &argv, &home).await?,
     };
     if value.get("ok").and_then(Value::as_bool) == Some(false) {
         return Err(anyhow!(
@@ -305,13 +324,12 @@ pub async fn fetch_page(
     for (k, v) in &args {
         http.push(("arg", format!("{k}={v}")));
     }
+    // `ide_http` never answers with a server that belongs to another project,
+    // so an `ok: false` payload here is this page's own failure and is reported
+    // as such below. Only "no usable server at all" takes the subprocess path.
     let value = match crate::ide_http::get(&bin, &home, "/ide/page", &http).await {
-        // A server that answers `ok: false` cannot render this page — most
-        // often it is a daemon that belongs to another project. Take the
-        // subprocess path, exactly as an unreachable server does, instead of
-        // letting one project's daemon freeze another project's page.
-        Some(value) if value.get("ok").and_then(Value::as_bool) != Some(false) => value,
-        _ => run_json(&bin, &argv, &home).await?,
+        Some(value) => value,
+        None => run_json(&bin, &argv, &home).await?,
     };
     if value.get("ok").and_then(Value::as_bool) == Some(false) {
         return Err(anyhow!(
@@ -410,6 +428,14 @@ pub async fn run_action(bin: PathBuf, home: PathBuf, args: Vec<String>, with_hom
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_permission_denial_gets_an_actionable_hint() {
+        // The Python traceback names `pyvenv.cfg` and nothing the user can act
+        // on; the denial is what has to be named.
+        assert!(permission_hint("PermissionError: [Errno 1] Operation not permitted").contains("Removable Volumes"));
+        assert!(permission_hint("ModuleNotFoundError: No module named 'yaml'").is_empty());
+    }
 
     #[test]
     fn page_reads_give_the_engine_its_home_and_project() -> Result<()> {
