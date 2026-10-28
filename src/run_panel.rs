@@ -12,6 +12,8 @@ use gpui::{
     Action, AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels, Render,
     Subscription, WeakEntity, Window, actions, px,
 };
+use schemars::JsonSchema;
+use serde::Deserialize;
 use ui::{IconName, prelude::*};
 use workspace::{
     Workspace,
@@ -19,7 +21,8 @@ use workspace::{
 };
 
 use crate::{
-    page::MiniOrkPage,
+    node_tab,
+    page::{self, MiniOrkPage},
     palette::{self as p, c},
     store::BoardStore,
 };
@@ -32,6 +35,36 @@ actions!(
     ]
 );
 
+/// Open a run's page in the editor area (or bring it forward).
+///
+/// The agent panel's run cards dispatch this *by name* (`mini_ork::OpenRun`,
+/// built with `App::build_action`): `agent_ui` is a dependency of this crate,
+/// so it cannot name the type. Keep the field names stable — they are the
+/// wire format.
+#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = mini_ork)]
+pub struct OpenRun {
+    /// The run id (`run-1791302645-a41c`).
+    pub run: String,
+    /// The tab title; the run id when empty.
+    #[serde(default)]
+    pub title: String,
+}
+
+/// Open one node of a run as its own tab (or bring it forward). Dispatched by
+/// name as `mini_ork::OpenNode`, like [`OpenRun`].
+#[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = mini_ork)]
+pub struct OpenNode {
+    /// The run id.
+    pub run: String,
+    /// The node id inside the run (`implementer`).
+    pub node: String,
+    /// The run's title for the tab tooltip; may be empty.
+    #[serde(default)]
+    pub title: String,
+}
+
 const RUN_PANEL_KEY: &str = "MiniOrkRunPanel";
 
 /// Hook every new workspace: put the Run panel in its right dock. A no-op when
@@ -43,6 +76,33 @@ pub fn init(cx: &mut App) {
         };
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<RunPanel>(window, cx);
+        });
+        // The workspace is borrowed while its action runs; the openers update
+        // it through its handle, so they run once the borrow ends.
+        workspace.register_action(|_, action: &OpenRun, window, cx| {
+            let workspace = cx.entity();
+            let (run, title) = (action.run.clone(), action.title.clone());
+            window.defer(cx, move |window, cx| {
+                page::open_run(&workspace, run, title, None, window, cx);
+            });
+        });
+        workspace.register_action(|_, action: &OpenNode, window, cx| {
+            let workspace = cx.entity();
+            let (run, node, title) = (action.run.clone(), action.node.clone(), action.title.clone());
+            window.defer(cx, move |window, cx| {
+                // No DAG model and no run page in hand: the tab reads the run
+                // page itself, as it does when opened from a Threads card.
+                node_tab::open_node_tab(
+                    &workspace,
+                    run,
+                    node,
+                    title,
+                    None,
+                    WeakEntity::new_invalid(),
+                    window,
+                    cx,
+                );
+            });
         });
         // The workspace is leased while `observe_new` runs, so the initial run
         // is read from the borrowed workspace rather than through its handle.
