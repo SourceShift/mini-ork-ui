@@ -1,6 +1,3 @@
-> [!IMPORTANT]
-> Remove this line to confirm you've reviewed this PR before submitting.
-
 # mini-ork IDE
 
 The native desktop interface for [mini-ork](https://github.com/SourceShift/mini-ork):
