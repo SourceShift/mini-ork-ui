@@ -19,6 +19,7 @@ use workspace::{OpenOptions, Toast, Workspace, notifications::NotificationId};
 use crate::{
     board::{self, Board},
     sidebar::MiniOrkSidebar,
+    threads,
 };
 
 /// The board is re-read when mini-ork writes to the project's `.mini-ork`
@@ -556,8 +557,21 @@ pub fn perform(
         cx.open_url(url);
     } else if let Some(spec) = action.get("terminal") {
         open_terminal(spec, workspace, window, cx);
+    } else if let Some(session) = action.get("thread_session").and_then(Value::as_str) {
+        // The engine knows which thread orchestrates this run, so open that
+        // thread instead of starting another. A thread this window no longer
+        // has falls through to the prompt below, where sending the command
+        // binds the run to the new one.
+        let opened = threads::open_session(workspace, session, true, window, cx);
+        if !opened {
+            if let Some(text) = action.get("thread").and_then(Value::as_str) {
+                let send = action.get("send").and_then(Value::as_bool).unwrap_or(false);
+                new_thread(workspace, text, send, window, cx);
+            }
+        }
     } else if let Some(text) = action.get("thread").and_then(Value::as_str) {
-        new_thread(workspace, text, window, cx);
+        let send = action.get("send").and_then(Value::as_bool).unwrap_or(false);
+        new_thread(workspace, text, send, window, cx);
     } else if let Some(root) = action.get("project").and_then(Value::as_str) {
         crate::projects::switch_to(workspace, PathBuf::from(root), window, cx);
     } else if action.get("project_pick").and_then(Value::as_bool) == Some(true) {
@@ -664,7 +678,17 @@ fn string_map(value: Option<&Value>) -> BTreeMap<String, String> {
 }
 
 /// A new mini-ork thread in the Agent panel; `text` becomes its first prompt.
-pub fn new_thread(workspace: &Entity<Workspace>, text: &str, window: &mut Window, cx: &mut App) {
+///
+/// With `send`, the prompt is also submitted: a command whose whole point is
+/// to *bind* something (a run's orchestrator) leaves the run unbound if it is
+/// only typed into the editor, and the next click then starts a second thread.
+pub fn new_thread(
+    workspace: &Entity<Workspace>,
+    text: &str,
+    send: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
     if let Ok(action) = cx.build_action(
         "agent::NewExternalAgentThread",
         Some(serde_json::json!({ "agent": "mini-ork" })),
@@ -677,10 +701,15 @@ pub fn new_thread(workspace: &Entity<Workspace>, text: &str, window: &mut Window
     }
     let prompt = agent_ui::ExternalSourcePrompt::new(&text);
     workspace.update(cx, |workspace, cx| {
-        if let Some(panel) = workspace.panel::<agent_ui::AgentPanel>(cx) {
-            panel.update(cx, |panel, cx| {
-                panel.new_agent_thread_with_external_source_prompt(prompt, window, cx)
-            });
+        let Some(panel) = workspace.panel::<agent_ui::AgentPanel>(cx) else {
+            return;
+        };
+        let thread = panel.update(cx, |panel, cx| {
+            panel.new_agent_thread_with_external_source_prompt(prompt, window, cx);
+            if send { panel.active_thread_view(cx) } else { None }
+        });
+        if let Some(thread) = thread {
+            thread.update(cx, |thread, cx| thread.send(window, cx));
         }
     });
 }

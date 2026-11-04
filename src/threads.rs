@@ -46,6 +46,30 @@ pub fn for_root(root: Option<&Path>, cx: &App) -> Vec<ThreadMetadata> {
     threads
 }
 
+/// Open the thread whose ACP session id is `session`; `false` when unknown.
+///
+/// The engine names a thread by the session id it minted, so a run's
+/// orchestrator arrives here as a session id and nothing else. `false` means
+/// this window has no such thread — it was deleted, or it belongs to another
+/// machine — and the caller decides what to do rather than opening nothing.
+pub fn open_session(
+    workspace: &Entity<Workspace>,
+    session: &str,
+    focus: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let Some(store) = ThreadMetadataStore::try_global(cx) else {
+        return false;
+    };
+    let metadata = store.read_with(cx, |store, _| store.entry_by_session_id(session).cloned());
+    let Some(metadata) = metadata else {
+        return false;
+    };
+    open(workspace, &metadata, focus, window, cx);
+    true
+}
+
 /// Open `metadata`'s thread in this workspace's agent panel.
 ///
 /// Follows `crates/sidebar/src/sidebar.rs::load_agent_thread_in_workspace`: an

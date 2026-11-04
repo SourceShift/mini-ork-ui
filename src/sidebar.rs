@@ -100,7 +100,7 @@ fn start_thread_in(
     if let Some(multi) = multi_workspace.upgrade() {
         multi.update(cx, |multi, cx| multi.activate(workspace.clone(), None, window, cx));
     }
-    store::new_thread(workspace, "", window, cx);
+    store::new_thread(workspace, "", false, window, cx);
 }
 
 pub struct MiniOrkSidebar {
@@ -750,7 +750,7 @@ impl MiniOrkSidebar {
                 .tooltip(Tooltip::text("New thread"))
                 .on_click(move |_, window, cx| {
                     if let Some(workspace) = workspace.clone() {
-                        store::new_thread(&workspace, "", window, cx);
+                        store::new_thread(&workspace, "", false, window, cx);
                     }
                 })
                 .into_any_element();
