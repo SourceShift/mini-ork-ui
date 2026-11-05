@@ -70,7 +70,7 @@ const THUMBS_RETRY: Duration = Duration::from_secs(10);
 const THUMBS_LIVE_GAP: Duration = Duration::from_millis(1500);
 
 /// The activity bar, top to bottom: key, glyph, tooltip.
-const ACTIVITIES: [(&str, &str, &str); 12] = [
+const ACTIVITIES: [(&str, &str, &str); 13] = [
     ("threads", "▤", "Threads (task board)"),
     ("inbox", "✉", "Inbox — what needs you"),
     ("kanban", "▦", "Board"),
@@ -80,6 +80,7 @@ const ACTIVITIES: [(&str, &str, &str); 12] = [
     ("autos", "◷", "Automations & scheduling"),
     ("lanes", "$", "Models, lanes & cost"),
     ("learn", "❖", "Learning & memory"),
+    ("skills", "✧", "Skills registry"),
     ("context", "◫", "Context (ContextNest)"),
     ("nodes", "⬡", "Nodes & sandboxes"),
     ("setup", "⚙", "Setup & health"),
