@@ -682,6 +682,10 @@ fn string_map(value: Option<&Value>) -> BTreeMap<String, String> {
 /// With `send`, the prompt is also submitted: a command whose whole point is
 /// to *bind* something (a run's orchestrator) leaves the run unbound if it is
 /// only typed into the editor, and the next click then starts a second thread.
+///
+/// The panel's dock is revealed at the end. A page's button is clicked from
+/// the editor, and a thread created inside a closed dock is drawn nowhere —
+/// the button that created it then reads as doing nothing at all.
 pub fn new_thread(
     workspace: &Entity<Workspace>,
     text: &str,
@@ -696,12 +700,21 @@ pub fn new_thread(
         window.dispatch_action(action, cx);
     }
     let text = text.trim().to_string();
-    if text.is_empty() {
-        return;
-    }
-    let prompt = agent_ui::ExternalSourcePrompt::new(&text);
-    workspace.update(cx, |workspace, cx| {
-        let Some(panel) = workspace.panel::<agent_ui::AgentPanel>(cx) else {
+    if !text.is_empty() {
+        let prompt = agent_ui::ExternalSourcePrompt::new(&text);
+        let panel = workspace.read(cx).panel::<agent_ui::AgentPanel>(cx);
+        let Some(panel) = panel else {
+            log::warn!(
+                "mini-ork IDE: this workspace has no Agent panel — the thread action opened nothing"
+            );
+            workspace.update(cx, |workspace, cx| {
+                let toast = Toast::new(
+                    NotificationId::named(SharedString::from("mini-ork-action")),
+                    "mini-ork: this workspace has no Agent panel to open the command in",
+                )
+                .autohide();
+                workspace.show_toast(toast, cx);
+            });
             return;
         };
         let thread = panel.update(cx, |panel, cx| {
@@ -711,6 +724,11 @@ pub fn new_thread(
         if let Some(thread) = thread {
             thread.update(cx, |thread, cx| thread.send(window, cx));
         }
+    }
+    // `reveal_panel`, not `focus_panel`: focusing toggles, so a panel that is
+    // already focused would be shut — a second click would hide the thread.
+    workspace.update(cx, |workspace, cx| {
+        workspace.reveal_panel::<agent_ui::AgentPanel>(window, cx)
     });
 }
 
