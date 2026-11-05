@@ -13,7 +13,8 @@ use anyhow::Result;
 use gpui::{App, Context, Entity, Render, SharedString, Subscription, Task, WeakEntity, Window};
 use project::Project;
 use serde_json::Value;
-use ui::{Divider, DividerColor, Tooltip, prelude::*};
+use settings::{Settings, update_settings_file};
+use ui::{ContextMenu, Divider, DividerColor, IconPosition, Tooltip, prelude::*, right_click_menu};
 use util::ResultExt as _;
 use workspace::{HideStatusItem, ItemHandle, StatusItemView, Workspace};
 
@@ -25,7 +26,161 @@ use crate::{
     store::BoardStore,
 };
 
+/// The status bar's segment switches, read from the user's settings.
+///
+/// Zed gives every status item its own "Hide Button", but mini-ork's bar is one
+/// composite: the counts, the spend, the scheduler and the lane alert are a
+/// single item, so hiding all of them to reach one is not a choice. The
+/// settings file is the storage because it is where the user already hides
+/// everything else, and it reloads live.
+#[derive(Clone, Debug, Default)]
+pub struct MiniOrkSettings {
+    status_bar: MiniOrkStatusBarSettings,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MiniOrkStatusBarSettings {
+    needs_you: bool,
+    working: bool,
+    failed: bool,
+    spend: bool,
+    scheduler: bool,
+    lanes: bool,
+    version: bool,
+    file_sessions: bool,
+}
+
+impl MiniOrkStatusBarSettings {
+    /// Whether the left item still draws anything after the board toggle, and
+    /// so whether the divider in front of the segments is worth a pixel.
+    fn any_left(self) -> bool {
+        self.needs_you || self.working || self.failed || self.spend || self.scheduler
+    }
+}
+
+impl Default for MiniOrkStatusBarSettings {
+    fn default() -> Self {
+        // Unset means shown: a segment that only appears once the user edits a
+        // settings file would look like a broken build, not a default.
+        Self {
+            needs_you: true,
+            working: true,
+            failed: true,
+            spend: true,
+            scheduler: true,
+            lanes: true,
+            version: true,
+            file_sessions: true,
+        }
+    }
+}
+
+impl Settings for MiniOrkSettings {
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        let shown = |value: Option<bool>| value.unwrap_or(true);
+        let bar = content.mini_ork.as_ref().and_then(|mini_ork| mini_ork.status_bar.as_ref());
+        Self {
+            status_bar: MiniOrkStatusBarSettings {
+                needs_you: shown(bar.and_then(|bar| bar.needs_you)),
+                working: shown(bar.and_then(|bar| bar.working)),
+                failed: shown(bar.and_then(|bar| bar.failed)),
+                spend: shown(bar.and_then(|bar| bar.spend)),
+                scheduler: shown(bar.and_then(|bar| bar.scheduler)),
+                lanes: shown(bar.and_then(|bar| bar.lanes)),
+                version: shown(bar.and_then(|bar| bar.version)),
+                file_sessions: shown(bar.and_then(|bar| bar.file_sessions)),
+            },
+        }
+    }
+}
+
+fn status_bar_settings(cx: &App) -> MiniOrkStatusBarSettings {
+    MiniOrkSettings::try_get(cx)
+        .map(|settings| settings.status_bar)
+        .unwrap_or_default()
+}
+
+/// One switchable piece of the mini-ork status bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Segment {
+    NeedsYou,
+    Working,
+    Failed,
+    Spend,
+    Scheduler,
+    Lanes,
+    Version,
+    FileSessions,
+}
+
+impl Segment {
+    const ALL: [Segment; 8] = [
+        Segment::NeedsYou,
+        Segment::Working,
+        Segment::Failed,
+        Segment::Spend,
+        Segment::Scheduler,
+        Segment::Lanes,
+        Segment::Version,
+        Segment::FileSessions,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Segment::NeedsYou => "Needs you",
+            Segment::Working => "Working",
+            Segment::Failed => "Failed",
+            Segment::Spend => "Spend",
+            Segment::Scheduler => "Scheduler",
+            Segment::Lanes => "Lane alert",
+            Segment::Version => "Version",
+            Segment::FileSessions => "File sessions",
+        }
+    }
+
+    fn shown(self, settings: &MiniOrkStatusBarSettings) -> bool {
+        match self {
+            Segment::NeedsYou => settings.needs_you,
+            Segment::Working => settings.working,
+            Segment::Failed => settings.failed,
+            Segment::Spend => settings.spend,
+            Segment::Scheduler => settings.scheduler,
+            Segment::Lanes => settings.lanes,
+            Segment::Version => settings.version,
+            Segment::FileSessions => settings.file_sessions,
+        }
+    }
+}
+
+/// Persist one segment's visibility to the user's settings file. Only the one
+/// key is written, so the rest of the file — and the rest of the bar — is
+/// untouched.
+fn set_segment_shown(segment: Segment, shown: bool, cx: &App) {
+    let fs = <dyn fs::Fs>::global(cx);
+    update_settings_file(fs, cx, move |content, _cx| {
+        let bar = content
+            .mini_ork
+            .get_or_insert_default()
+            .status_bar
+            .get_or_insert_default();
+        let slot = match segment {
+            Segment::NeedsYou => &mut bar.needs_you,
+            Segment::Working => &mut bar.working,
+            Segment::Failed => &mut bar.failed,
+            Segment::Spend => &mut bar.spend,
+            Segment::Scheduler => &mut bar.scheduler,
+            Segment::Lanes => &mut bar.lanes,
+            Segment::Version => &mut bar.version,
+            Segment::FileSessions => &mut bar.file_sessions,
+        };
+        *slot = Some(shown);
+    });
+}
+
 pub fn init(cx: &mut App) {
+    if cx.has_global::<settings::SettingsStore>() {
+        MiniOrkSettings::register(cx);
+    }
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else {
             return;
@@ -158,6 +313,7 @@ impl Render for MiniOrkStatus {
                 })
         };
         let w = self.workspace.clone();
+        let settings = status_bar_settings(cx);
         // Spend is muted until it nears the cap: the colour is the only thing
         // here that should make you look.
         let spent = header.today_usd.unwrap_or(0.);
@@ -171,74 +327,109 @@ impl Render for MiniOrkStatus {
         h_flex()
             .gap_0p5()
             .child(
-                div()
-                    .id("status-board")
-                    .h_5()
-                    .px_1p5()
-                    .flex()
-                    .items_center()
-                    .text_size(rems_from_px(12_f32))
-                    .text_color(c(p::MUTED))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(c(p::HOVER)))
-                    .tooltip(Tooltip::text("Toggle task board"))
-                    .child("▤")
-                    .on_click({
+                right_click_menu("mini-ork-status-segments")
+                    .trigger({
                         let w = w.clone();
-                        move |_, window, cx| toggle_board(&w, window, cx)
+                        move |_is_active, _window, _cx| {
+                            let w = w.clone();
+                            div()
+                                .id("status-board")
+                                .h_5()
+                                .px_1p5()
+                                .flex()
+                                .items_center()
+                                .text_size(rems_from_px(12_f32))
+                                .text_color(c(p::MUTED))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(c(p::HOVER)))
+                                .tooltip(Tooltip::text("Toggle task board · right-click for segments"))
+                                .child("▤")
+                                .on_click(move |_, window, cx| toggle_board(&w, window, cx))
+                        }
+                    })
+                    .menu(move |window, cx| {
+                        let current = status_bar_settings(cx);
+                        ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+                            menu = menu.header("Status bar");
+                            for segment in Segment::ALL {
+                                let shown = segment.shown(&current);
+                                menu = menu.toggleable_entry(
+                                    segment.label(),
+                                    shown,
+                                    IconPosition::Start,
+                                    None,
+                                    move |_window, cx| set_segment_shown(segment, !shown, cx),
+                                );
+                            }
+                            menu
+                        })
                     }),
             )
-            .child(Divider::vertical().h_3p5().mx_1().color(DividerColor::Border))
-            .child(item(
-                "status-needs",
-                format!("✋ {} need you", header.needs_you),
-                if header.needs_you > 0 { p::ORANGE } else { p::SUB },
-                "Threads and gates waiting on you — opens the Inbox".into(),
-                "inbox",
-                None,
-                w.clone(),
-            ))
-            .child(item(
-                "status-working",
-                format!("● {} working", header.working),
-                if header.working > 0 { p::BLUE } else { p::SUB },
-                "Runs in flight — on the Threads board".into(),
-                "threads",
-                None,
-                w.clone(),
-            ))
-            .child(item(
-                "status-failed",
-                format!("✗ {} failed", header.failed),
-                if header.failed > 0 { p::RED } else { p::SUB },
-                "Failed runs — on the Threads board".into(),
-                "threads",
-                None,
-                w.clone(),
-            ))
-            .child(item(
-                "status-budget",
-                format!("{} / ${:.0}", money(header.today_usd), header.cap_usd),
-                budget_colour,
-                "Spend today against the daily cap".into(),
-                "lanes",
-                Some("cost"),
-                w.clone(),
-            ))
-            .child(item(
-                "status-scheduler",
-                format!("◷ {}", if header.scheduler_on { "on" } else { "off" }),
-                if header.scheduler_on { p::MUTED } else { p::YELLOW },
-                "Project scheduler".into(),
-                "autos",
-                Some("schedulers"),
-                w.clone(),
-            ))
+            .when(settings.any_left(), |this| {
+                this.child(Divider::vertical().h_3p5().mx_1().color(DividerColor::Border))
+            })
+            .when(settings.needs_you, |this| {
+                this.child(item(
+                    "status-needs",
+                    format!("✋ {} need you", header.needs_you),
+                    if header.needs_you > 0 { p::ORANGE } else { p::SUB },
+                    "Threads and gates waiting on you — opens the Inbox".into(),
+                    "inbox",
+                    None,
+                    w.clone(),
+                ))
+            })
+            .when(settings.working, |this| {
+                this.child(item(
+                    "status-working",
+                    format!("● {} working", header.working),
+                    if header.working > 0 { p::BLUE } else { p::SUB },
+                    "Runs in flight — on the Threads board".into(),
+                    "threads",
+                    None,
+                    w.clone(),
+                ))
+            })
+            .when(settings.failed, |this| {
+                this.child(item(
+                    "status-failed",
+                    format!("✗ {} failed", header.failed),
+                    if header.failed > 0 { p::RED } else { p::SUB },
+                    "Failed runs — on the Threads board".into(),
+                    "threads",
+                    None,
+                    w.clone(),
+                ))
+            })
+            .when(settings.spend, |this| {
+                this.child(item(
+                    "status-budget",
+                    format!("{} / ${:.0}", money(header.today_usd), header.cap_usd),
+                    budget_colour,
+                    "Spend today against the daily cap".into(),
+                    "lanes",
+                    Some("cost"),
+                    w.clone(),
+                ))
+            })
+            .when(settings.scheduler, |this| {
+                this.child(item(
+                    "status-scheduler",
+                    format!("◷ {}", if header.scheduler_on { "on" } else { "off" }),
+                    if header.scheduler_on { p::MUTED } else { p::YELLOW },
+                    "Project scheduler".into(),
+                    "autos",
+                    Some("schedulers"),
+                    w.clone(),
+                ))
+            })
             // Lanes are per-model detail: they earn a place in the bar only
             // when one is failing, and then as one alert rather than five bars.
-            .when_some(lane_alert(&header.lanes), |this, (label, tip)| {
-                this.child(Divider::vertical().h_3p5().mx_1().color(DividerColor::Border))
-                    .child(item("status-lane-alert", label, p::RED, tip, "lanes", Some("cost"), w.clone()))
+            .when(settings.lanes, |this| {
+                this.when_some(lane_alert(&header.lanes), |this, (label, tip)| {
+                    this.child(Divider::vertical().h_3p5().mx_1().color(DividerColor::Border))
+                        .child(item("status-lane-alert", label, p::RED, tip, "lanes", Some("cost"), w.clone()))
+                })
             })
     }
 }
@@ -289,6 +480,9 @@ impl MiniOrkVersion {
 
 impl Render for MiniOrkVersion {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !status_bar_settings(cx).version {
+            return div().into_any_element();
+        }
         let version = self
             .store
             .read(cx)
@@ -301,7 +495,7 @@ impl Render for MiniOrkVersion {
         } else {
             format!("mini-ork {version}").into()
         };
-        div().px(rems_from_px(7_f32)).text_size(rems_from_px(12_f32)).text_color(c(p::MUTED)).child(label)
+        div().px(rems_from_px(7_f32)).text_size(rems_from_px(12_f32)).text_color(c(p::MUTED)).child(label).into_any_element()
     }
 }
 
@@ -399,6 +593,9 @@ impl MiniOrkFileSessions {
 
 impl Render for MiniOrkFileSessions {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !status_bar_settings(cx).file_sessions {
+            return div().into_any_element();
+        }
         let sessions = self.sessions.read(cx);
         let (Some(target), Some(count)) = (sessions.target.clone(), sessions.count()) else {
             return div().into_any_element();
