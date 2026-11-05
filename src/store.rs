@@ -79,6 +79,29 @@ pub fn cached_page(home: &Path, key: &str, tab: Option<&str>, args: &BTreeMap<St
     cache.get(&page_cache_key(home, key, tab, args)).cloned()
 }
 
+/// Call `f` with every cached payload of `key`, in whichever tab and with
+/// whatever args this window read it. The palette uses this to reach tickets
+/// without fetching: whatever the user has already looked at is free, and a
+/// key never opened contributes nothing.
+///
+/// The callback runs under the cache lock and must not itself touch the cache
+/// or the app — the payloads are borrowed, not cloned, because a Board page is
+/// large and this runs on the palette's keystroke path.
+pub fn for_each_cached_page(home: &Path, key: &str, cx: &App, mut f: impl FnMut(&Value)) {
+    let Some(cache) = cx.try_global::<PageCache>() else {
+        return;
+    };
+    let Ok(cache) = cache.0.lock() else {
+        return;
+    };
+    let prefix = format!("{}|{key}|", home.display());
+    for (cached_key, value) in cache.iter() {
+        if cached_key.starts_with(&prefix) {
+            f(value);
+        }
+    }
+}
+
 /// Remember a payload for the next open of this page.
 pub fn remember_page(home: &Path, key: &str, tab: Option<&str>, args: &BTreeMap<String, String>, value: Value, cx: &App) {
     let Some(cache) = cx.try_global::<PageCache>() else {
