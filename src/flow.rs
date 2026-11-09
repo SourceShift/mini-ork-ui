@@ -395,7 +395,7 @@ fn parse_step(value: &Value) -> Option<Step> {
         label: str_of(value, "label"),
         sub: str_of(value, "sub"),
         state: str_of(value, "state"),
-        score: str_of(value, "score"),
+        score: score_of(value),
         action: value.get("do").cloned().unwrap_or(Value::Null),
     })
 }
@@ -448,6 +448,20 @@ fn parse_tier(value: &Value) -> Option<Tier> {
     })
 }
 
+/// A rubric score, with the grader-failure sentinel treated as "no score".
+///
+/// `mini_ork/gates/rubric_scoring.py` writes `{"score": -1, "parse_error": true}`
+/// when its own JSON failed to parse. A real rubric score is 0..8, so a
+/// negative one is never a result — rendering it verbatim reads as a genuine
+/// (negative) rating of the step.
+fn score_of(value: &Value) -> String {
+    let raw = str_of(value, "score");
+    match raw.trim().parse::<f64>() {
+        Ok(score) if score < 0. => String::new(),
+        _ => raw,
+    }
+}
+
 fn parse_review(value: &Value) -> Option<Review> {
     if !value.is_object() {
         return None;
@@ -457,7 +471,7 @@ fn parse_review(value: &Value) -> Option<Review> {
     Some(Review {
         hub: value.get("hub").and_then(parse_step),
         verdict: str_of(value, "verdict"),
-        score: str_of(value, "score"),
+        score: score_of(value),
         spokes: arr(value, "spokes").iter().filter_map(parse_spoke).collect(),
         // A Fix spoke only exists once a round has fired; rounds 0 is "none".
         fix: (rounds > 0).then(|| Fix { rounds, state: str_of(&fix_value, "state") }),
@@ -1318,29 +1332,6 @@ pub(crate) fn render_flow_part_a(
             .into_any_element(),
     );
 
-    // The legend, from `flow.legend`, sits at the map's top right.
-    if !map.legend.is_empty() {
-        let mut row = h_flex().absolute().top(px(6.)).right(px(12.)).gap(px(14.)).items_center();
-        for item in &map.legend {
-            row = row.child(
-                h_flex()
-                    .gap(px(6.))
-                    .items_center()
-                    .child(
-                        div().w(px(LEGEND_W)).h(px(LEGEND_H)).bg(c(state_colour(&item.key))),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .font(mono.clone())
-                            .text_color(c(p::SUB))
-                            .child(item.label.clone()),
-                    ),
-            );
-        }
-        pieces.push(row.into_any_element());
-    }
-
     // The stage chips, from `flow.stages`, run along the bottom; a click
     // scrolls its stage into view and highlights it for 1.5s.
     if !map.stages.is_empty() {
@@ -1512,6 +1503,38 @@ pub(crate) fn render_flow_part_a(
             cx.listener(|_page: &mut MiniOrkPage, _: &ClickEvent, _: &mut Window, _cx: &mut Context<MiniOrkPage>| {}),
             cx,
         ));
+    // The legend, from `flow.legend`, is a strip above the map viewport rather
+    // than an overlay inside it: it used to sit absolutely at the map's top
+    // right, where it painted over the last column. Above the scroller it is
+    // structurally incapable of overlapping the map, and `flex_wrap` lets a
+    // long legend take a second line instead of running off the edge.
+    let legend = (!map.legend.is_empty()).then(|| {
+        let mut row = h_flex()
+            .w_full()
+            .min_w_0()
+            .flex_wrap()
+            .justify_end()
+            .gap(px(14.))
+            .items_center()
+            .pb(px(8.))
+            .overflow_hidden();
+        for item in &map.legend {
+            row = row.child(
+                h_flex()
+                    .gap(px(6.))
+                    .items_center()
+                    .child(div().w(px(LEGEND_W)).h(px(LEGEND_H)).bg(c(state_colour(&item.key))))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .font(mono.clone())
+                            .text_color(c(p::SUB))
+                            .child(item.label.clone()),
+                    ),
+            );
+        }
+        row.into_any_element()
+    });
     v_flex()
         .w_full()
         .min_w_0()
@@ -1519,6 +1542,7 @@ pub(crate) fn render_flow_part_a(
         .border_1()
         .border_color(c(p::BORDER))
         .bg(c(p::CHROME))
+        .children(legend)
         .child(
             div().relative().w_full().child(scroller).child(controls).custom_scrollbars(
                 Scrollbars::always_visible(ScrollAxes::Horizontal).tracked_scroll_handle(scroll),
@@ -2130,4 +2154,37 @@ fn connectors(map: &Flow, layout: &Layout) -> Vec<Stroke> {
     }
 
     strokes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn review(raw: &str) -> Review {
+        parse_review(&serde_json::from_str(raw).expect("json")).expect("review object")
+    }
+
+    /// A rubric that failed to parse writes `{"score": -1, "parse_error": true}`
+    /// (`mini_ork/gates/rubric_scoring.py`). No real score is negative, so the
+    /// sentinel must not reach the screen.
+    #[test]
+    fn the_parse_error_sentinel_is_not_a_score() {
+        assert_eq!(review(r#"{"score": -1, "parse_error": true}"#).score, "");
+        assert_eq!(review(r#"{"score": "-1"}"#).score, "");
+        assert_eq!(review(r#"{"score": -1.0}"#).score, "");
+    }
+
+    #[test]
+    fn a_real_score_survives() {
+        assert_eq!(review(r#"{"verdict": "pass", "score": 6}"#).score, "6");
+        assert_eq!(review(r#"{"score": "7/8"}"#).score, "7/8");
+        assert_eq!(review(r#"{"score": 0}"#).score, "0");
+    }
+
+    #[test]
+    fn a_step_score_uses_the_same_rule() {
+        let step = parse_step(&serde_json::from_str(r#"{"label": "Design", "score": -1}"#).unwrap())
+            .expect("step object");
+        assert_eq!(step.score, "");
+    }
 }
