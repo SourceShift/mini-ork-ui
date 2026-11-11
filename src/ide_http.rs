@@ -40,7 +40,7 @@ use futures::AsyncReadExt as _;
 use gpui::BackgroundExecutor;
 use http_client::{AsyncBody, HttpClient, HttpRequestExt as _, Request, StatusCode, Url};
 use serde_json::Value;
-use util::command::Stdio;
+use util::command::{Child, Stdio};
 
 use crate::board::IDE_SPEC;
 
@@ -78,6 +78,14 @@ static CHOOSING: futures::lock::Mutex<()> = futures::lock::Mutex::new(());
 /// once per (port, home), since the answer cannot change while the same
 /// process owns the port.
 static HOME_CHECK: Mutex<Option<(u16, PathBuf, bool)>> = Mutex::new(None);
+/// The server this process started, held for as long as the IDE runs. The
+/// handle is what ends it: `start` sets `kill_on_drop(true)`, so dropping this
+/// stops the process. It used to outlive the app, but a server on a negotiated
+/// free port is never rediscovered — the next launch probes only `7090` — so
+/// outliving the IDE left one orphaned `mini-ork serve` on a random port after
+/// every launch that had to negotiate a port. Holding the handle keeps the
+/// server warm for every read of this session and stops it when the app exits.
+static STARTED: Mutex<Option<Child>> = Mutex::new(None);
 
 pub fn init(client: Arc<dyn HttpClient>, executor: BackgroundExecutor) {
     HTTP.set(client).ok();
@@ -189,9 +197,22 @@ pub async fn get(bin: &Path, home: &Path, path: &str, query: &[(&str, String)]) 
         return None;
     };
     match wait_for_server(port, home, path, query, Some(&mut child)).await {
-        Waited::Ready(value) | Waited::Refused(Some(value)) => Some(value),
-        Waited::Refused(None) => None,
+        Waited::Ready(value) => {
+            keep(child);
+            Some(value)
+        }
+        Waited::Refused(Some(value)) => {
+            keep(child);
+            Some(value)
+        }
+        Waited::Refused(None) => {
+            keep(child);
+            None
+        }
         Waited::Timeout => {
+            // `child` is not kept: it drops here, and `kill_on_drop(true)` stops
+            // a server that never answered, rather than holding it for the life
+            // of the app.
             GAVE_UP.store(true, Ordering::Relaxed);
             PORT.store(0, Ordering::Relaxed);
             None
@@ -369,10 +390,13 @@ async fn probe(port: u16, home: &Path, path: &str, query: &[(&str, String)]) -> 
     }
 }
 
-/// Start `mini-ork serve` for this home and let it outlive the IDE. Detached: no
-/// pipes to inherit, and no kill when the handle drops, since the whole point is
-/// that it stays up between reads.
-fn start(bin: &Path, home: &Path, port: u16) -> std::io::Result<util::command::Child> {
+/// Start `mini-ork serve` for this home, detached, and bound to this process.
+///
+/// Detached: no pipes to inherit, so the server is not tied to the IDE's
+/// terminal. Bound: the handle is kept in `STARTED` and `kill_on_drop(true)`
+/// stops the server when the IDE exits — it stays up between reads, which is
+/// what the warm interpreter buys, but not past the app that started it.
+fn start(bin: &Path, home: &Path, port: u16) -> std::io::Result<Child> {
     let mut command = util::command::new_command(bin);
     command
         .args([
@@ -390,13 +414,23 @@ fn start(bin: &Path, home: &Path, port: u16) -> std::io::Result<util::command::C
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .kill_on_drop(false);
+        .kill_on_drop(true);
     if let Some(project) = home.parent() {
         command.current_dir(project);
     }
     command.spawn().inspect_err(|error| {
         log::warn!("mini-ork: could not start the IDE server: {error:#}");
     })
+}
+
+/// Hold the server this process started for the rest of the session.
+///
+/// Assigning over a previous handle drops it, and `kill_on_drop(true)` stops
+/// that process — so this cannot accumulate servers either.
+fn keep(child: Child) {
+    if let Ok(mut slot) = STARTED.lock() {
+        *slot = Some(child);
+    }
 }
 
 #[cfg(test)]
